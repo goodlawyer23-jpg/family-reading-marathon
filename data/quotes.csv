@@ -1,0 +1,4 @@
+﻿quote_id,member_id,book_id,page_number,quote_text,comment,created_at
+quote_001,member_mom,book_001,42,함께 걸으면 멀리 갈 수 있어.,우리 가족 마라톤이랑 닮았다.,2026-07-07 21:09:49
+quote_002,member_child1,book_006,31,새로운 문이 열리는 느낌이야.,나도 마법 학교에 가고 싶다.,2026-07-07 21:09:49
+quote_003,member_dad,book_003,68,마음을 이해하는 일은 천천히 배워도 된다.,아이들과 이야기해 보고 싶은 문장.,2026-07-07 21:09:49

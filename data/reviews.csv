@@ -1,0 +1,4 @@
+﻿review_id,member_id,book_id,rating,one_line_review,full_review,finished_date,created_at
+review_001,member_child2,book_004,5,수박 속에서 수영하는 상상이 제일 재미있다.,그림이 시원해서 여름에 또 보고 싶다.,2026-07-06,2026-07-07 21:09:49
+review_002,member_mom,book_001,5,천천히 오래 남는 이야기.,가족이 함께 읽고 이야기하기 좋다.,,2026-07-07 21:09:49
+review_003,member_dad,book_002,4,사람 냄새 나는 따뜻한 소설.,짧게 읽기 좋아서 독서마라톤 첫 책으로 좋다.,,2026-07-07 21:09:49
