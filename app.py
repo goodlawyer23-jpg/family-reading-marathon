@@ -40,24 +40,27 @@ SAMPLE_DIR = BASE_DIR / "sample_data"
 
 CSV_COLUMNS = {
     "books": [
-        "book_id", "reader_member_id", "title", "author", "publisher", "isbn", "image_url",
+        "book_id", "marathon_id", "reader_member_id", "title", "author", "publisher", "isbn", "image_url",
         "description", "pubdate", "total_pages", "source_api", "created_at",
     ],
     "family_members": [
         "member_id", "name", "role", "age_group", "weight", "avatar", "created_at",
     ],
     "reading_logs": [
-        "log_id", "member_id", "book_id", "reading_date", "pages_read", "weighted_pages",
+        "log_id", "marathon_id", "member_id", "book_id", "reading_date", "pages_read", "weighted_pages",
         "start_page", "end_page", "memo", "created_at",
     ],
     "quotes": [
-        "quote_id", "member_id", "book_id", "page_number", "quote_text", "comment", "created_at",
+        "quote_id", "marathon_id", "member_id", "book_id", "page_number", "quote_text", "comment", "created_at",
     ],
     "reviews": [
-        "review_id", "member_id", "book_id", "rating", "one_line_review", "full_review",
+        "review_id", "marathon_id", "member_id", "book_id", "rating", "one_line_review", "full_review",
         "finished_date", "created_at",
     ],
-    "settings": ["marathon_name", "start_date", "end_date", "family_target_pages", "unit_name"],
+    "settings": [
+        "marathon_id", "marathon_name", "start_date", "end_date", "family_target_pages",
+        "unit_name", "is_active", "created_at",
+    ],
 }
 
 CSV_PATHS = {
@@ -70,14 +73,30 @@ CSV_PATHS = {
 }
 
 DEFAULT_SETTINGS = {
+    "marathon_id": "2026-07",
     "marathon_name": "2026년 7월 우리가족 독서마라톤",
     "start_date": "2026-07-01",
     "end_date": "2026-07-31",
     "family_target_pages": 2000,
     "unit_name": "페이지",
+    "is_active": True,
+    "created_at": "",
 }
 
 PLACEHOLDER_COVER = "https://placehold.co/160x220?text=BOOK"
+EMOJI_OPTIONS = ["👨", "👩", "👧", "🧒", "👦", "👶", "🐰", "🐻", "🦊", "🐯", "🐥", "🌟"]
+AGE_GROUP_OPTIONS = ["성인", "청소년", "어린이", "유아"]
+DEFAULT_WEIGHT_BY_AGE = {"성인": 1.0, "청소년": 1.1, "어린이": 1.4, "유아": 2.0}
+
+
+def recommended_weight(age_group: str) -> float:
+    return DEFAULT_WEIGHT_BY_AGE.get(str(age_group).strip(), 1.0)
+
+
+def normalize_age_group(age_group: str) -> str:
+    value = str(age_group or "").strip()
+    aliases = {"초등": "어린이", "초등학생": "어린이", "초등 어린이": "어린이", "기타": "성인", "": "성인"}
+    return aliases.get(value, value if value in AGE_GROUP_OPTIONS else "성인")
 
 
 def now_str() -> str:
@@ -126,9 +145,300 @@ def write_csv(key: str, df: pd.DataFrame) -> None:
     df[CSV_COLUMNS[key]].to_csv(CSV_PATHS[key], index=False, encoding="utf-8-sig")
 
 
+def normalize_bool(value) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "활성", "active"}
+
+
+def make_marathon_id(start_date_value) -> str:
+    try:
+        dt = pd.to_datetime(start_date_value).date()
+        return dt.strftime("%Y-%m")
+    except Exception:
+        return f"marathon_{uuid.uuid4().hex[:8]}"
+
+
+def migrate_data_schema() -> None:
+    """기존 단일 마라톤 CSV를 여러 마라톤 구조로 자동 보정합니다."""
+    ensure_directories()
+
+    settings_df = read_csv("settings")
+    if settings_df.empty:
+        default = DEFAULT_SETTINGS.copy()
+        default["created_at"] = now_str()
+        settings_df = pd.DataFrame([default])
+
+    for col in CSV_COLUMNS["settings"]:
+        if col not in settings_df.columns:
+            settings_df[col] = ""
+
+    if settings_df["marathon_id"].astype(str).str.strip().eq("").all():
+        first_start = settings_df.iloc[0].get("start_date", DEFAULT_SETTINGS["start_date"])
+        settings_df.loc[settings_df.index[0], "marathon_id"] = make_marathon_id(first_start)
+
+    for idx in settings_df.index:
+        if not str(settings_df.loc[idx, "marathon_id"]).strip():
+            settings_df.loc[idx, "marathon_id"] = make_marathon_id(settings_df.loc[idx, "start_date"])
+        if not str(settings_df.loc[idx, "created_at"]).strip():
+            settings_df.loc[idx, "created_at"] = now_str()
+
+    active_mask = settings_df["is_active"].apply(normalize_bool)
+    if not active_mask.any():
+        settings_df["is_active"] = False
+        settings_df.loc[settings_df.index[0], "is_active"] = True
+    else:
+        # active는 하나만 유지합니다.
+        first_active_idx = settings_df[active_mask].index[0]
+        settings_df["is_active"] = False
+        settings_df.loc[first_active_idx, "is_active"] = True
+
+    write_csv("settings", settings_df)
+    active_id = get_active_marathon_id(settings_df)
+
+    members_df = read_csv("family_members")
+    if not members_df.empty and "age_group" in members_df.columns:
+        normalized_age = members_df["age_group"].apply(normalize_age_group)
+        if not normalized_age.astype(str).equals(members_df["age_group"].astype(str)):
+            members_df["age_group"] = normalized_age
+            write_csv("family_members", members_df)
+
+    for key in ["books", "reading_logs", "quotes", "reviews"]:
+        df = read_csv(key)
+        if df.empty:
+            continue
+        if "marathon_id" not in df.columns:
+            df["marathon_id"] = active_id
+        blank_mask = df["marathon_id"].astype(str).str.strip().eq("")
+        if blank_mask.any():
+            df.loc[blank_mask, "marathon_id"] = active_id
+        write_csv(key, df)
+
+
+def get_active_marathon(settings_df: pd.DataFrame | None = None) -> dict:
+    if settings_df is None:
+        settings_df = read_csv("settings")
+    if settings_df.empty:
+        return DEFAULT_SETTINGS.copy()
+    df = settings_df.copy()
+    if "is_active" not in df.columns:
+        df["is_active"] = False
+    active = df[df["is_active"].apply(normalize_bool)]
+    row = active.iloc[0].to_dict() if not active.empty else df.iloc[0].to_dict()
+    result = {**DEFAULT_SETTINGS, **row}
+    if not str(result.get("marathon_id", "")).strip():
+        result["marathon_id"] = make_marathon_id(result.get("start_date", DEFAULT_SETTINGS["start_date"]))
+    result["family_target_pages"] = safe_int(result.get("family_target_pages"), DEFAULT_SETTINGS["family_target_pages"])
+    return result
+
+
+def get_active_marathon_id(settings_df: pd.DataFrame | None = None) -> str:
+    return str(get_active_marathon(settings_df).get("marathon_id", DEFAULT_SETTINGS["marathon_id"])).strip()
+
+
+def get_marathon_options(settings_df: pd.DataFrame) -> dict:
+    if settings_df.empty:
+        return {DEFAULT_SETTINGS["marathon_name"]: DEFAULT_SETTINGS["marathon_id"]}
+    options = {}
+    for _, row in settings_df.iterrows():
+        mid = str(row.get("marathon_id", "")).strip() or make_marathon_id(row.get("start_date", ""))
+        name = str(row.get("marathon_name", "독서마라톤")).strip() or mid
+        date_label = f"{row.get('start_date', '')} ~ {row.get('end_date', '')}"
+        active_mark = " · active" if normalize_bool(row.get("is_active", False)) else ""
+        label = f"{name} ({date_label}){active_mark}"
+        base_label = label
+        n = 2
+        while label in options:
+            label = f"{base_label} #{n}"
+            n += 1
+        options[label] = mid
+    return options
+
+
+def get_marathon_by_id(settings_df: pd.DataFrame, marathon_id: str) -> dict:
+    if settings_df.empty:
+        return DEFAULT_SETTINGS.copy()
+    matched = settings_df[settings_df["marathon_id"].astype(str) == str(marathon_id)]
+    row = matched.iloc[0].to_dict() if not matched.empty else get_active_marathon(settings_df)
+    result = {**DEFAULT_SETTINGS, **row}
+    result["family_target_pages"] = safe_int(result.get("family_target_pages"), DEFAULT_SETTINGS["family_target_pages"])
+    return result
+
+
+def filter_by_marathon(df: pd.DataFrame, marathon_id: str) -> pd.DataFrame:
+    if df.empty or "marathon_id" not in df.columns:
+        return df.copy()
+    return df[df["marathon_id"].astype(str).str.strip() == str(marathon_id).strip()].copy()
+
+
+def scoped_data_for_marathon(data: dict, marathon_id: str) -> dict:
+    scoped = data.copy()
+    for key in ["books", "reading_logs", "quotes", "reviews"]:
+        scoped[key] = filter_by_marathon(data[key], marathon_id)
+    return scoped
+
+
+def set_active_marathon(marathon_id: str) -> None:
+    settings_df = read_csv("settings")
+    if settings_df.empty:
+        return
+    settings_df["is_active"] = settings_df["marathon_id"].astype(str) == str(marathon_id)
+    write_csv("settings", settings_df)
+
+
+def start_new_marathon(marathon_name: str, start_date_value, end_date_value, family_target_pages: int, unit_name: str) -> str:
+    settings_df = read_csv("settings")
+    new_id = make_marathon_id(start_date_value)
+    existing_ids = set(settings_df["marathon_id"].astype(str)) if not settings_df.empty else set()
+    base_id = new_id
+    suffix = 2
+    while new_id in existing_ids:
+        new_id = f"{base_id}-{suffix}"
+        suffix += 1
+    if not settings_df.empty:
+        settings_df["is_active"] = False
+    new_row = {
+        "marathon_id": new_id,
+        "marathon_name": str(marathon_name).strip() or f"{new_id} 우리가족 독서마라톤",
+        "start_date": start_date_value.isoformat() if hasattr(start_date_value, "isoformat") else str(start_date_value),
+        "end_date": end_date_value.isoformat() if hasattr(end_date_value, "isoformat") else str(end_date_value),
+        "family_target_pages": safe_int(family_target_pages, 2000),
+        "unit_name": str(unit_name).strip() or "페이지",
+        "is_active": True,
+        "created_at": now_str(),
+    }
+    settings_df = pd.concat([settings_df, pd.DataFrame([new_row])], ignore_index=True)
+    write_csv("settings", settings_df)
+    return new_id
+
+
+def get_next_marathon_defaults(settings_df: pd.DataFrame) -> dict:
+    active = get_active_marathon(settings_df)
+    try:
+        base_start = (pd.to_datetime(active.get("end_date", date.today())).date() + timedelta(days=1))
+    except Exception:
+        today = date.today()
+        base_start = (pd.Timestamp(today.replace(day=1)) + pd.offsets.MonthBegin(1)).date()
+    start_value = base_start.replace(day=1) if base_start.day != 1 else base_start
+    end_value = (pd.Timestamp(start_value) + pd.offsets.MonthEnd(0)).date()
+    name = f"{start_value.year}년 {start_value.month}월 우리가족 독서마라톤"
+    return {
+        "name": name,
+        "start_date": start_value,
+        "end_date": end_value,
+        "target": 2000,
+        "unit": "페이지",
+    }
+
+
+def delete_marathon_and_related_data(marathon_id: str) -> dict:
+    """선택한 독서마라톤과 해당 마라톤에 속한 책장/기록을 삭제합니다. 러너는 삭제하지 않습니다."""
+    marathon_id = str(marathon_id).strip()
+    result = {"settings": 0, "books": 0, "logs": 0, "quotes": 0, "reviews": 0, "new_active_id": ""}
+    settings_df = read_csv("settings")
+    if settings_df.empty or "marathon_id" not in settings_df.columns:
+        result["error"] = "삭제할 독서마라톤을 찾지 못했습니다."
+        return result
+
+    target_mask = settings_df["marathon_id"].astype(str) == marathon_id
+    result["settings"] = int(target_mask.sum())
+    if result["settings"] == 0:
+        result["error"] = "삭제할 독서마라톤을 찾지 못했습니다."
+        return result
+    if len(settings_df) <= 1:
+        result["error"] = "독서마라톤은 최소 1개가 필요합니다. 마지막 마라톤은 삭제할 수 없습니다."
+        return result
+
+    was_active = bool(settings_df.loc[target_mask, "is_active"].apply(normalize_bool).any())
+    settings_df = settings_df.loc[~target_mask].copy()
+    if was_active:
+        settings_df["is_active"] = False
+        try:
+            order = pd.to_datetime(settings_df["start_date"], errors="coerce")
+            new_active_idx = order.sort_values(ascending=False).index[0]
+        except Exception:
+            new_active_idx = settings_df.index[-1]
+        settings_df.loc[new_active_idx, "is_active"] = True
+        result["new_active_id"] = str(settings_df.loc[new_active_idx, "marathon_id"])
+    elif not settings_df["is_active"].apply(normalize_bool).any():
+        settings_df.loc[settings_df.index[0], "is_active"] = True
+        result["new_active_id"] = str(settings_df.loc[settings_df.index[0], "marathon_id"])
+    write_csv("settings", settings_df)
+
+    for key, result_key in [("books", "books"), ("reading_logs", "logs"), ("quotes", "quotes"), ("reviews", "reviews")]:
+        df = read_csv(key)
+        if df.empty or "marathon_id" not in df.columns:
+            continue
+        mask = df["marathon_id"].astype(str) == marathon_id
+        result[result_key] = int(mask.sum())
+        if mask.any():
+            write_csv(key, df.loc[~mask].copy())
+    return result
+
+
 def load_all_data() -> dict:
     ensure_csv_files()
     return {key: read_csv(key) for key in CSV_COLUMNS.keys()}
+
+
+def delete_runner_and_related_data(member_id: str) -> dict:
+    """러너와 해당 러너에게 연결된 책장/기록을 함께 삭제합니다."""
+    member_id = str(member_id)
+    result = {"members": 0, "books": 0, "logs": 0, "quotes": 0, "reviews": 0}
+
+    members_df = read_csv("family_members")
+    if members_df.empty or "member_id" not in members_df.columns:
+        return result
+
+    member_mask = members_df["member_id"].astype(str) == member_id
+    result["members"] = int(member_mask.sum())
+    if result["members"] == 0:
+        return result
+
+    books_df = read_csv("books")
+    if not books_df.empty and "reader_member_id" in books_df.columns:
+        runner_book_ids = books_df.loc[books_df["reader_member_id"].astype(str) == member_id, "book_id"].astype(str).tolist()
+    else:
+        runner_book_ids = []
+
+    logs_df = read_csv("reading_logs")
+    quotes_df = read_csv("quotes")
+    reviews_df = read_csv("reviews")
+
+    # 책장은 reader_member_id 기준으로 삭제합니다.
+    if not books_df.empty:
+        book_mask = books_df["reader_member_id"].astype(str) == member_id
+        result["books"] = int(book_mask.sum())
+        books_df = books_df.loc[~book_mask].copy()
+
+    # 기록은 member_id 기준으로 삭제하되, 혹시 남아 있는 책 연결 기록도 함께 정리합니다.
+    if not logs_df.empty:
+        log_mask = logs_df["member_id"].astype(str) == member_id
+        if runner_book_ids and "book_id" in logs_df.columns:
+            log_mask = log_mask | logs_df["book_id"].astype(str).isin(runner_book_ids)
+        result["logs"] = int(log_mask.sum())
+        logs_df = logs_df.loc[~log_mask].copy()
+
+    if not quotes_df.empty:
+        quote_mask = quotes_df["member_id"].astype(str) == member_id
+        if runner_book_ids and "book_id" in quotes_df.columns:
+            quote_mask = quote_mask | quotes_df["book_id"].astype(str).isin(runner_book_ids)
+        result["quotes"] = int(quote_mask.sum())
+        quotes_df = quotes_df.loc[~quote_mask].copy()
+
+    if not reviews_df.empty:
+        review_mask = reviews_df["member_id"].astype(str) == member_id
+        if runner_book_ids and "book_id" in reviews_df.columns:
+            review_mask = review_mask | reviews_df["book_id"].astype(str).isin(runner_book_ids)
+        result["reviews"] = int(review_mask.sum())
+        reviews_df = reviews_df.loc[~review_mask].copy()
+
+    members_df = members_df.loc[~member_mask].copy()
+
+    write_csv("family_members", members_df)
+    write_csv("books", books_df)
+    write_csv("reading_logs", logs_df)
+    write_csv("quotes", quotes_df)
+    write_csv("reviews", reviews_df)
+    return result
 
 
 def safe_int(value, default: int = 0) -> int:
@@ -150,11 +460,7 @@ def safe_float(value, default: float = 0.0) -> float:
 
 
 def get_settings(settings_df: pd.DataFrame) -> dict:
-    if settings_df.empty:
-        return DEFAULT_SETTINGS.copy()
-    row = settings_df.iloc[0].to_dict()
-    row["family_target_pages"] = safe_int(row.get("family_target_pages"), DEFAULT_SETTINGS["family_target_pages"])
-    return {**DEFAULT_SETTINGS, **row}
+    return get_active_marathon(settings_df)
 
 
 def get_member_name(member_id: str, members_df: pd.DataFrame) -> str:
@@ -186,6 +492,13 @@ def enrich_logs(logs_df: pd.DataFrame, members_df: pd.DataFrame, books_df: pd.Da
 
 def member_options(members_df: pd.DataFrame) -> dict:
     return {f"{row.avatar} {row.name} ({row.role})": row.member_id for row in members_df.itertuples()}
+
+
+def emoji_options_with_current(current: str = "") -> list[str]:
+    current = str(current or "").strip()
+    if current and current not in EMOJI_OPTIONS:
+        return [current] + EMOJI_OPTIONS
+    return EMOJI_OPTIONS.copy()
 
 
 def book_options(books_df: pd.DataFrame) -> dict:
@@ -277,21 +590,22 @@ def clear_today_form_state(member_id: str, book_id: str) -> None:
 
 def create_sample_data() -> None:
     today = date(2026, 7, 6)
+    sample_marathon_id = "2026-07"
     members = pd.DataFrame([
         {"member_id": "member_dad", "name": "아빠", "role": "기록왕", "age_group": "성인", "weight": 1.0, "avatar": "👨", "created_at": now_str()},
         {"member_id": "member_mom", "name": "엄마", "role": "응원단장", "age_group": "성인", "weight": 1.0, "avatar": "👩", "created_at": now_str()},
-        {"member_id": "member_child1", "name": "첫째", "role": "모험가", "age_group": "초등", "weight": 1.2, "avatar": "🧒", "created_at": now_str()},
-        {"member_id": "member_child2", "name": "둘째", "role": "그림책 러너", "age_group": "유아", "weight": 1.5, "avatar": "👧", "created_at": now_str()},
+        {"member_id": "member_child1", "name": "첫째", "role": "모험가", "age_group": "어린이", "weight": 1.4, "avatar": "🧒", "created_at": now_str()},
+        {"member_id": "member_child2", "name": "둘째", "role": "그림책 러너", "age_group": "유아", "weight": 2.0, "avatar": "👧", "created_at": now_str()},
     ], columns=CSV_COLUMNS["family_members"])
 
     books = pd.DataFrame([
-        {"book_id": "book_001", "reader_member_id": "member_mom", "title": "긴긴밤", "author": "루리", "publisher": "문학동네", "isbn": "9788954677158", "image_url": PLACEHOLDER_COVER, "description": "서로 다른 존재들이 함께 길을 걷는 이야기", "pubdate": "2021-02-03", "total_pages": 144, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_002", "reader_member_id": "member_dad", "title": "불편한 편의점", "author": "김호연", "publisher": "나무옆의자", "isbn": "9791161571188", "image_url": PLACEHOLDER_COVER, "description": "동네 편의점에서 만나는 따뜻한 사람들의 이야기", "pubdate": "2021-04-20", "total_pages": 268, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_003", "reader_member_id": "member_dad", "title": "아몬드", "author": "손원평", "publisher": "창비", "isbn": "9788936434267", "image_url": PLACEHOLDER_COVER, "description": "감정을 느끼기 어려운 소년의 성장 이야기", "pubdate": "2017-03-31", "total_pages": 264, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_004", "reader_member_id": "member_child2", "title": "수박 수영장", "author": "안녕달", "publisher": "창비", "isbn": "9788936446819", "image_url": PLACEHOLDER_COVER, "description": "여름날 수박 속에서 펼쳐지는 상상 그림책", "pubdate": "2015-07-30", "total_pages": 52, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_005", "reader_member_id": "member_child2", "title": "강아지똥", "author": "권정생", "publisher": "길벗어린이", "isbn": "9788986621135", "image_url": PLACEHOLDER_COVER, "description": "작고 낮은 존재의 소중함을 알려주는 그림책", "pubdate": "1996-04-01", "total_pages": 36, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_006", "reader_member_id": "member_child1", "title": "해리 포터와 마법사의 돌", "author": "J.K. 롤링", "publisher": "문학수첩", "isbn": "9788983927620", "image_url": PLACEHOLDER_COVER, "description": "마법 학교에서 시작되는 모험", "pubdate": "2019-11-19", "total_pages": 268, "source_api": "sample", "created_at": now_str()},
-        {"book_id": "book_007", "reader_member_id": "member_child2", "title": "채소 학교와 쌍둥이 딸기", "author": "나카야 미와", "publisher": "웅진주니어", "isbn": "9788901253541", "image_url": PLACEHOLDER_COVER, "description": "채소 친구들이 등장하는 귀여운 그림책", "pubdate": "2021-06-30", "total_pages": 40, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_001", "marathon_id": sample_marathon_id, "reader_member_id": "member_mom", "title": "긴긴밤", "author": "루리", "publisher": "문학동네", "isbn": "9788954677158", "image_url": PLACEHOLDER_COVER, "description": "서로 다른 존재들이 함께 길을 걷는 이야기", "pubdate": "2021-02-03", "total_pages": 144, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_002", "marathon_id": sample_marathon_id, "reader_member_id": "member_dad", "title": "불편한 편의점", "author": "김호연", "publisher": "나무옆의자", "isbn": "9791161571188", "image_url": PLACEHOLDER_COVER, "description": "동네 편의점에서 만나는 따뜻한 사람들의 이야기", "pubdate": "2021-04-20", "total_pages": 268, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_003", "marathon_id": sample_marathon_id, "reader_member_id": "member_dad", "title": "아몬드", "author": "손원평", "publisher": "창비", "isbn": "9788936434267", "image_url": PLACEHOLDER_COVER, "description": "감정을 느끼기 어려운 소년의 성장 이야기", "pubdate": "2017-03-31", "total_pages": 264, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_004", "marathon_id": sample_marathon_id, "reader_member_id": "member_child2", "title": "수박 수영장", "author": "안녕달", "publisher": "창비", "isbn": "9788936446819", "image_url": PLACEHOLDER_COVER, "description": "여름날 수박 속에서 펼쳐지는 상상 그림책", "pubdate": "2015-07-30", "total_pages": 52, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_005", "marathon_id": sample_marathon_id, "reader_member_id": "member_child2", "title": "강아지똥", "author": "권정생", "publisher": "길벗어린이", "isbn": "9788986621135", "image_url": PLACEHOLDER_COVER, "description": "작고 낮은 존재의 소중함을 알려주는 그림책", "pubdate": "1996-04-01", "total_pages": 36, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_006", "marathon_id": sample_marathon_id, "reader_member_id": "member_child1", "title": "해리 포터와 마법사의 돌", "author": "J.K. 롤링", "publisher": "문학수첩", "isbn": "9788983927620", "image_url": PLACEHOLDER_COVER, "description": "마법 학교에서 시작되는 모험", "pubdate": "2019-11-19", "total_pages": 268, "source_api": "sample", "created_at": now_str()},
+        {"book_id": "book_007", "marathon_id": sample_marathon_id, "reader_member_id": "member_child2", "title": "채소 학교와 쌍둥이 딸기", "author": "나카야 미와", "publisher": "웅진주니어", "isbn": "9788901253541", "image_url": PLACEHOLDER_COVER, "description": "채소 친구들이 등장하는 귀여운 그림책", "pubdate": "2021-06-30", "total_pages": 40, "source_api": "sample", "created_at": now_str()},
     ], columns=CSV_COLUMNS["books"])
 
     logs_raw = [
@@ -315,6 +629,7 @@ def create_sample_data() -> None:
     for idx, (member_id, book_id, days_ago, pages, start_page, end_page, memo) in enumerate(logs_raw, start=1):
         logs.append({
             "log_id": f"log_{idx:03d}",
+            "marathon_id": sample_marathon_id,
             "member_id": member_id,
             "book_id": book_id,
             "reading_date": (today - timedelta(days=days_ago)).isoformat(),
@@ -328,18 +643,18 @@ def create_sample_data() -> None:
     logs_df = pd.DataFrame(logs, columns=CSV_COLUMNS["reading_logs"])
 
     quotes = pd.DataFrame([
-        {"quote_id": "quote_001", "member_id": "member_mom", "book_id": "book_001", "page_number": 42, "quote_text": "함께 걸으면 멀리 갈 수 있어.", "comment": "우리 가족 마라톤이랑 닮았다.", "created_at": now_str()},
-        {"quote_id": "quote_002", "member_id": "member_child1", "book_id": "book_006", "page_number": 31, "quote_text": "새로운 문이 열리는 느낌이야.", "comment": "나도 마법 학교에 가고 싶다.", "created_at": now_str()},
-        {"quote_id": "quote_003", "member_id": "member_dad", "book_id": "book_003", "page_number": 68, "quote_text": "마음을 이해하는 일은 천천히 배워도 된다.", "comment": "아이들과 이야기해 보고 싶은 문장.", "created_at": now_str()},
+        {"quote_id": "quote_001", "marathon_id": sample_marathon_id, "member_id": "member_mom", "book_id": "book_001", "page_number": 42, "quote_text": "함께 걸으면 멀리 갈 수 있어.", "comment": "우리 가족 마라톤이랑 닮았다.", "created_at": now_str()},
+        {"quote_id": "quote_002", "marathon_id": sample_marathon_id, "member_id": "member_child1", "book_id": "book_006", "page_number": 31, "quote_text": "새로운 문이 열리는 느낌이야.", "comment": "나도 마법 학교에 가고 싶다.", "created_at": now_str()},
+        {"quote_id": "quote_003", "marathon_id": sample_marathon_id, "member_id": "member_dad", "book_id": "book_003", "page_number": 68, "quote_text": "마음을 이해하는 일은 천천히 배워도 된다.", "comment": "아이들과 이야기해 보고 싶은 문장.", "created_at": now_str()},
     ], columns=CSV_COLUMNS["quotes"])
 
     reviews = pd.DataFrame([
-        {"review_id": "review_001", "member_id": "member_child2", "book_id": "book_004", "rating": 5, "one_line_review": "수박 속에서 수영하는 상상이 제일 재미있다.", "full_review": "그림이 시원해서 여름에 또 보고 싶다.", "finished_date": "2026-07-06", "created_at": now_str()},
-        {"review_id": "review_002", "member_id": "member_mom", "book_id": "book_001", "rating": 5, "one_line_review": "천천히 오래 남는 이야기.", "full_review": "가족이 함께 읽고 이야기하기 좋다.", "finished_date": "", "created_at": now_str()},
-        {"review_id": "review_003", "member_id": "member_dad", "book_id": "book_002", "rating": 4, "one_line_review": "사람 냄새 나는 따뜻한 소설.", "full_review": "짧게 읽기 좋아서 독서마라톤 첫 책으로 좋다.", "finished_date": "", "created_at": now_str()},
+        {"review_id": "review_001", "marathon_id": sample_marathon_id, "member_id": "member_child2", "book_id": "book_004", "rating": 5, "one_line_review": "수박 속에서 수영하는 상상이 제일 재미있다.", "full_review": "그림이 시원해서 여름에 또 보고 싶다.", "finished_date": "2026-07-06", "created_at": now_str()},
+        {"review_id": "review_002", "marathon_id": sample_marathon_id, "member_id": "member_mom", "book_id": "book_001", "rating": 5, "one_line_review": "천천히 오래 남는 이야기.", "full_review": "가족이 함께 읽고 이야기하기 좋다.", "finished_date": "", "created_at": now_str()},
+        {"review_id": "review_003", "marathon_id": sample_marathon_id, "member_id": "member_dad", "book_id": "book_002", "rating": 4, "one_line_review": "사람 냄새 나는 따뜻한 소설.", "full_review": "짧게 읽기 좋아서 독서마라톤 첫 책으로 좋다.", "finished_date": "", "created_at": now_str()},
     ], columns=CSV_COLUMNS["reviews"])
 
-    settings = pd.DataFrame([{**DEFAULT_SETTINGS}], columns=CSV_COLUMNS["settings"])
+    settings = pd.DataFrame([{**DEFAULT_SETTINGS, "marathon_id": sample_marathon_id, "is_active": True, "created_at": now_str()}], columns=CSV_COLUMNS["settings"])
 
     write_csv("family_members", members)
     write_csv("books", books)
@@ -681,8 +996,9 @@ def build_page_lookup_message(total_pages: int, lookup_result: dict | None) -> t
 
 
 def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bool, str, str]:
-    """책장에 책을 추가합니다. 같은 책+같은 구성원 조합은 중복 등록하지 않습니다."""
+    """책장에 책을 추가합니다. 같은 마라톤 안에서 같은 책+같은 러너 조합은 중복 등록하지 않습니다."""
     books_df = read_csv("books")
+    active_marathon_id = get_active_marathon_id(read_csv("settings"))
     title = clean_html(book_data.get("title", "")).strip()
     reader_member_id = str(reader_member_id or "").strip()
     isbn = str(book_data.get("isbn", "") or "").strip()
@@ -699,15 +1015,16 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
 
     page_message, detail_message = build_page_lookup_message(total_pages, lookup_result)
 
-    duplicate_book_mask = same_book_mask(books_df, book_data)
-    if len(duplicate_book_mask) == len(books_df) and duplicate_book_mask.any():
-        same_reader_mask = books_df.get("reader_member_id", pd.Series([""] * len(books_df))).astype(str).str.strip() == reader_member_id
-        same_book_same_reader = books_df[duplicate_book_mask & same_reader_mask]
+    scoped_books_df = filter_by_marathon(books_df, active_marathon_id)
+    duplicate_book_mask = same_book_mask(scoped_books_df, book_data)
+    if len(duplicate_book_mask) == len(scoped_books_df) and duplicate_book_mask.any():
+        same_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == reader_member_id
+        same_book_same_reader = scoped_books_df[duplicate_book_mask & same_reader_mask]
         if not same_book_same_reader.empty:
-            return False, f"이미 이 구성원의 책장에 《{title or '이 책'}》이 있습니다.", "중복 책장 추가 방지"
+            return False, f"이미 이 러너의 책장에 《{title or '이 책'}》이 있습니다.", "중복 책장 추가 방지"
 
-        no_reader_mask = books_df.get("reader_member_id", pd.Series([""] * len(books_df))).astype(str).str.strip() == ""
-        no_reader_rows = books_df[duplicate_book_mask & no_reader_mask]
+        no_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == ""
+        no_reader_rows = scoped_books_df[duplicate_book_mask & no_reader_mask]
         if reader_member_id and not no_reader_rows.empty:
             idx = no_reader_rows.index[0]
             books_df.loc[idx, "reader_member_id"] = reader_member_id
@@ -716,10 +1033,11 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
             write_csv("books", books_df)
             # 저장 직후 다음 렌더링에서 반드시 최신 CSV를 읽도록 표시합니다.
             st.session_state["books_csv_updated_at"] = now_str()
-            return True, f"기존 책장 항목에 읽는 사람을 연결했습니다. {page_message}", detail_message
+            return True, f"기존 책장 항목에 읽는 러너를 연결했습니다. {page_message}", detail_message
 
     row = {col: book_data.get(col, "") for col in CSV_COLUMNS["books"]}
     row["book_id"] = make_id("book")
+    row["marathon_id"] = active_marathon_id
     row["reader_member_id"] = reader_member_id or row.get("reader_member_id", "")
     row["title"] = title
     row["author"] = clean_html(row.get("author", ""))
@@ -757,26 +1075,158 @@ def calculate_summary(data: dict) -> dict:
 
 def get_member_stats(logs_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
     if members_df.empty:
-        return pd.DataFrame(columns=["member_id", "member_name", "pages_read", "weighted_pages", "record_days"])
+        return pd.DataFrame(columns=["member_id", "name", "avatar", "member_name", "pages_read", "weighted_pages", "record_days"])
+    members = members_df.copy()
+    members["name"] = members["name"].astype(str)
+    members["avatar"] = members["avatar"].astype(str)
+    members["member_name"] = (members["avatar"].str.strip() + " " + members["name"].str.strip()).str.strip()
     if logs_df.empty:
-        stats = members_df[["member_id", "name", "avatar"]].copy()
-        stats["member_name"] = stats["avatar"].astype(str) + " " + stats["name"].astype(str)
+        stats = members[["member_id", "name", "avatar", "member_name"]].copy()
         stats["pages_read"] = 0
         stats["weighted_pages"] = 0.0
         stats["record_days"] = 0
-        return stats[["member_id", "member_name", "pages_read", "weighted_pages", "record_days"]]
+        return stats[["member_id", "name", "avatar", "member_name", "pages_read", "weighted_pages", "record_days"]]
     grouped = logs_df.groupby("member_id").agg(
         pages_read=("pages_read", "sum"),
         weighted_pages=("weighted_pages", "sum"),
         record_days=("reading_date", pd.Series.nunique),
     ).reset_index()
-    members = members_df.copy()
-    members["member_name"] = members["avatar"].astype(str) + " " + members["name"].astype(str)
-    stats = members[["member_id", "member_name"]].merge(grouped, on="member_id", how="left").fillna(0)
+    stats = members[["member_id", "name", "avatar", "member_name"]].merge(grouped, on="member_id", how="left").fillna(0)
     stats["pages_read"] = stats["pages_read"].astype(int)
     stats["weighted_pages"] = stats["weighted_pages"].astype(float).round(1)
     stats["record_days"] = stats["record_days"].astype(int)
     return stats.sort_values("weighted_pages", ascending=False)
+
+
+def make_emoji_track(progress_percent: float, length: int = 18, runner: str = "🏃‍➡️") -> str:
+    """진행률을 오른쪽 방향 마라톤 트랙으로 변환합니다."""
+    progress_percent = max(0.0, min(float(progress_percent or 0), 100.0))
+    if length <= 1:
+        return runner
+    position = int(round((progress_percent / 100) * (length - 1)))
+    return "━" * position + runner + "━" * (length - position - 1)
+
+
+def get_badge_for_member(row, leader_id: str, steady_id: str, finished_member_ids: set[str], quote_member_ids: set[str]) -> str:
+    member_id = str(row.get("member_id", "")) if isinstance(row, dict) else str(row.member_id)
+    weighted_pages = safe_float(row.get("weighted_pages", 0) if isinstance(row, dict) else row.weighted_pages, 0)
+    record_days = safe_int(row.get("record_days", 0) if isinstance(row, dict) else row.record_days, 0)
+    if member_id == leader_id and weighted_pages > 0:
+        return "🌟 앞장서 달리는 러너"
+    if member_id == steady_id and record_days > 0:
+        return "🔥 꾸준히 함께 달리는 러너"
+    if member_id in finished_member_ids:
+        return "🏁 완주 경험자"
+    if member_id in quote_member_ids:
+        return "💬 문장 수집가"
+    if weighted_pages > 0:
+        return "👟 함께 달리는 중"
+    return "🌱 출발 준비"
+
+
+def get_dashboard_encouragement(summary: dict, member_stats_df: pd.DataFrame) -> str:
+    progress = safe_float(summary.get("progress", 0), 0)
+    remain = safe_float(summary.get("remain", 0), 0)
+    unit_name = summary.get("settings", {}).get("unit_name", "페이지")
+    if progress >= 100:
+        return "🎉 우리 가족이 함께 결승선에 도착했어요! 완주 기록을 함께 돌아볼 시간입니다."
+    if not member_stats_df.empty and safe_float(member_stats_df.iloc[0].get("weighted_pages", 0), 0) > 0:
+        leader = str(member_stats_df.iloc[0].get("name", member_stats_df.iloc[0].get("member_name", "가족")))
+        return f"🤝 {leader}님이 오늘의 앞장 러너예요. 하지만 이 마라톤은 모두가 함께 결승선을 향해 가는 협동 미션입니다."
+    if progress > 0:
+        return f"📚 우리 가족은 이미 목표의 {progress:.1f}%를 함께 달성했어요. 남은 거리는 {remain:,.0f}{unit_name}입니다."
+    return "🌱 오늘 10쪽만 읽어도 우리 가족 결승선에 한 걸음 더 가까워져요!"
+
+
+def display_unit(unit_name: str) -> str:
+    """좁은 화면에서 잘리지 않도록 표시용 단위를 짧게 변환합니다."""
+    unit_name = str(unit_name or "페이지").strip()
+    if unit_name == "페이지":
+        return "쪽"
+    return unit_name
+
+
+def render_family_marathon_track(summary: dict) -> None:
+    settings = summary["settings"]
+    progress = safe_float(summary.get("progress", 0), 0)
+    track = make_emoji_track(progress, length=24, runner="🏃‍➡️")
+    unit = display_unit(settings.get("unit_name", "페이지"))
+    target_pages = safe_int(settings.get("family_target_pages", 0), 0)
+    total_pages = safe_int(round(safe_float(summary.get("total_weighted", 0), 0)), 0)
+    remain_pages = safe_int(round(max(safe_float(summary.get("remain", 0), 0), 0)), 0)
+    st.markdown("### 🏁 가족 독서마라톤 트랙")
+    st.markdown(f"#### 우리 가족은 결승선까지 **{progress:.1f}%** 왔어요!")
+    st.progress(min(progress / 100, 1.0), text=f"가족 전체 진행률 {progress:.1f}%")
+    st.markdown(
+        f"""
+        <div style="padding: 1rem; border-radius: 1rem; border: 1px solid rgba(120,120,120,.25); background: rgba(250,250,250,.55); margin: .5rem 0 1rem 0;">
+            <div style="font-size: 1.05rem; margin-bottom: .35rem;"><b>START</b> {track} <b>GOAL</b></div>
+            <div style="font-size: .95rem;">🎯 목표 {target_pages:,}{unit} · 📚 누적 {total_pages:,}{unit} · 🚩 남은 거리 {remain_pages:,}{unit}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_family_contribution_cards(member_stats_df: pd.DataFrame) -> None:
+    st.markdown("### 🤝 함께 만든 독서 거리")
+    st.caption("이 마라톤은 순위 경쟁이 아니라, 우리 가족이 함께 결승선을 향해 가는 협동 미션입니다.")
+    if member_stats_df.empty:
+        st.info("러너를 등록하면 우리 가족 기여도가 표시됩니다.")
+        return
+
+    total_weighted = safe_float(member_stats_df["weighted_pages"].sum(), 0) if "weighted_pages" in member_stats_df.columns else 0
+    card_count = min(max(len(member_stats_df), 1), 4)
+    cols = st.columns(card_count)
+    for idx, (_, row) in enumerate(member_stats_df.iterrows()):
+        contribution = (safe_float(row.get("weighted_pages", 0), 0) / total_weighted * 100) if total_weighted > 0 else 0
+        with cols[idx % card_count]:
+            st.markdown(
+                f"""
+                <div style="padding: 1rem; border-radius: 1rem; border: 1px solid rgba(120,120,120,.25); background: rgba(255,255,255,.72); text-align: center; margin-bottom: .75rem; min-height: 120px;">
+                    <div style="font-size: 1.6rem;">{row.get('avatar', '🏃')}</div>
+                    <div style="font-weight: 700; margin-top: .15rem;">{html.escape(str(row.get('name', '러너')))}</div>
+                    <div style="font-size: 2rem; font-weight: 800; margin-top: .35rem;">{contribution:.0f}%</div>
+                    <div style="font-size: .85rem; opacity: .75;">함께 보탠 거리</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def render_runner_cards(member_stats_df: pd.DataFrame, reviews_df: pd.DataFrame, quotes_df: pd.DataFrame) -> None:
+    st.markdown("### 🪪 우리 가족 러너 카드")
+    if member_stats_df.empty:
+        st.info("러너를 등록하면 러너 카드가 표시됩니다.")
+        return
+
+    leader_id = str(member_stats_df.iloc[0].get("member_id", "")) if safe_float(member_stats_df.iloc[0].get("weighted_pages", 0), 0) > 0 else ""
+    steady_df = member_stats_df.sort_values(["record_days", "weighted_pages"], ascending=False)
+    steady_id = str(steady_df.iloc[0].get("member_id", "")) if not steady_df.empty and safe_int(steady_df.iloc[0].get("record_days", 0), 0) > 0 else ""
+    finished_member_ids = set()
+    if not reviews_df.empty and "finished_date" in reviews_df.columns:
+        finished_rows = reviews_df[reviews_df["finished_date"].astype(str).str.strip().str.len() > 0]
+        finished_member_ids = set(finished_rows["member_id"].astype(str))
+    quote_member_ids = set(quotes_df["member_id"].astype(str)) if not quotes_df.empty and "member_id" in quotes_df.columns else set()
+
+    cols = st.columns(2)
+    for idx, (_, row) in enumerate(member_stats_df.iterrows()):
+        badge = get_badge_for_member(row.to_dict(), leader_id, steady_id, finished_member_ids, quote_member_ids)
+        with cols[idx % 2]:
+            st.markdown(
+                f"""
+                <div style="padding: 1rem; border-radius: 1rem; border: 1px solid rgba(120,120,120,.25); background: rgba(255,255,255,.65); margin-bottom: .75rem;">
+                    <div style="font-size: 1.35rem; font-weight: 700;">{row.get('avatar', '🏃')} {html.escape(str(row.get('name', '')))}</div>
+                    <div style="margin-top: .4rem;">{badge}</div>
+                    <div style="margin-top: .55rem; font-size: .95rem; line-height: 1.7;">
+                        📖 실제 읽은 페이지: <b>{safe_int(row.get('pages_read', 0)):,}쪽</b><br>
+                        🤝 기여 반영 거리: <b>{safe_float(row.get('weighted_pages', 0)):,.1f}쪽</b><br>
+                        📅 기록일 수: <b>{safe_int(row.get('record_days', 0))}일</b>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 def get_last_end_page(logs_df: pd.DataFrame, member_id: str, book_id: str) -> int:
@@ -817,47 +1267,74 @@ def get_book_progress(book_id: str, books_df: pd.DataFrame, logs_df: pd.DataFram
 
 def render_metric_cards(summary: dict) -> None:
     settings = summary["settings"]
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("가족 목표", f"{safe_int(settings['family_target_pages']):,} {settings['unit_name']}")
-    col2.metric("누적 기록", f"{summary['total_weighted']:,.1f} {settings['unit_name']}")
-    col3.metric("진행률", f"{summary['progress']:.1f}%")
-    col4.metric("남은 거리", f"{summary['remain']:,.1f} {settings['unit_name']}")
+    unit = display_unit(settings.get("unit_name", "페이지"))
+    metrics = [
+        ("가족 목표", f"{safe_int(settings.get('family_target_pages', 0)):,}{unit}"),
+        ("누적 기록", f"{safe_int(round(safe_float(summary.get('total_weighted', 0), 0))):,}{unit}"),
+        ("진행률", f"{safe_float(summary.get('progress', 0), 0):.1f}%"),
+        ("남은 거리", f"{safe_int(round(max(safe_float(summary.get('remain', 0), 0), 0))):,}{unit}"),
+    ]
+    cols = st.columns(4)
+    for col, (label, value) in zip(cols, metrics):
+        with col:
+            st.markdown(
+                f"""
+                <div style="padding: .8rem .75rem; border-radius: .9rem; border: 1px solid rgba(120,120,120,.18); background: rgba(255,255,255,.72); min-height: 95px;">
+                    <div style="font-size: .92rem; opacity: .78; margin-bottom: .35rem; white-space: nowrap;">{label}</div>
+                    <div style="font-size: clamp(1.45rem, 3.3vw, 2.1rem); font-weight: 750; line-height: 1.15; white-space: nowrap; letter-spacing: -0.04em;">{value}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     st.progress(min(summary["progress"] / 100, 1.0), text=f"가족 독서마라톤 진행률 {summary['progress']:.1f}%")
 
 
 def page_dashboard(data: dict) -> None:
-    st.title("🏃‍♀️ 우리가족 독서마라톤")
+    st.title("🏃‍➡️ 우리가족 독서마라톤")
     st.caption("책을 읽은 만큼 가족 마라톤 트랙이 앞으로 나아갑니다.")
 
-    summary = calculate_summary(data)
-    settings = summary["settings"]
+    active_marathon = get_active_marathon(data["settings"])
+    active_marathon_id = active_marathon["marathon_id"]
+    scoped_data = scoped_data_for_marathon(data, active_marathon_id)
+    summary = calculate_summary(scoped_data)
+    settings = active_marathon
+    summary["settings"] = settings
     st.info(f"{settings['marathon_name']} · {settings['start_date']} ~ {settings['end_date']}")
+
+    member_stats_df = get_member_stats(summary["logs"], data["family_members"])
+
+    render_family_marathon_track(summary)
+    st.info(get_dashboard_encouragement(summary, member_stats_df))
     render_metric_cards(summary)
 
-    if st.button("🎁 샘플 데이터 생성 / 초기화", type="primary"):
-        create_sample_data()
-        st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
-        st.rerun()
+    with st.expander("🛠️ 개발/시연용 도구", expanded=False):
+        st.caption("발표 시연이나 초기 테스트가 필요할 때만 사용하세요. 기존 CSV 데이터가 샘플 데이터로 초기화됩니다.")
+        if st.button("🎁 샘플 데이터 생성 / 초기화", type="primary"):
+            create_sample_data()
+            st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
+            st.rerun()
 
-    st.subheader("👟 구성원별 누적 페이지")
-    member_stats_df = get_member_stats(summary["logs"], data["family_members"])
     if member_stats_df.empty:
-        st.warning("아직 가족 구성원이 없습니다. 샘플 데이터를 생성하거나 구성원을 CSV에 추가해주세요.")
+        st.warning("아직 러너가 없습니다. 샘플 데이터를 생성하거나 러너를 추가해주세요.")
     else:
-        chart_df = member_stats_df.rename(columns={"member_name": "구성원", "weighted_pages": "가중치 반영 페이지"})
-        fig = px.bar(chart_df, x="구성원", y="가중치 반영 페이지", text="가중치 반영 페이지")
-        fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        render_family_contribution_cards(member_stats_df)
+        render_runner_cards(member_stats_df, scoped_data["reviews"], scoped_data["quotes"])
 
-        rank_df = member_stats_df.copy()
-        rank_df.insert(0, "순위", range(1, len(rank_df) + 1))
-        st.dataframe(
-            rank_df.rename(columns={
-                "member_name": "구성원", "pages_read": "실제 읽은 페이지", "weighted_pages": "가중치 반영 페이지", "record_days": "기록일 수",
-            })[["순위", "구성원", "실제 읽은 페이지", "가중치 반영 페이지", "기록일 수"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        with st.expander("📊 기여 현황 자세히 보기", expanded=False):
+            chart_df = member_stats_df.rename(columns={"member_name": "러너", "weighted_pages": "가중치 반영 페이지"})
+            fig = px.bar(chart_df, x="러너", y="가중치 반영 페이지", text="가중치 반영 페이지")
+            fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+            rank_df = member_stats_df.copy()
+            rank_df.insert(0, "기여 순서", range(1, len(rank_df) + 1))
+            st.dataframe(
+                rank_df.rename(columns={
+                    "member_name": "러너", "pages_read": "실제 읽은 페이지", "weighted_pages": "가중치 반영 페이지", "record_days": "기록일 수",
+                })[["기여 순서", "러너", "실제 읽은 페이지", "가중치 반영 페이지", "기록일 수"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     st.subheader("🕒 최근 기록 피드")
     logs_df = summary["logs"]
@@ -875,7 +1352,7 @@ def page_book_search(data: dict) -> None:
 
     members_df = data["family_members"]
     if members_df.empty:
-        st.warning("책을 책장에 추가하려면 읽을 가족 구성원이 필요합니다. 먼저 샘플 데이터를 생성하거나 가족 구성원을 추가해주세요.")
+        st.warning("책을 책장에 추가하려면 함께 달릴 러너가 필요합니다. 먼저 샘플 데이터를 생성하거나 러너를 추가해주세요.")
         return
 
     m_options = member_options(members_df)
@@ -918,9 +1395,9 @@ def page_book_search(data: dict) -> None:
             query = st.text_input(label, placeholder=placeholder)
             search_submitted = st.form_submit_button("검색하기", type="primary")
 
-        st.markdown("#### 2단계. 이 책을 읽을 가족 구성원을 선택하세요")
-        st.caption("검색 결과에서 책장에 추가하면, 아래에서 선택한 가족 구성원의 책장에 바로 연결됩니다.")
-        selected_reader_label = st.selectbox("읽을 가족 구성원", list(m_options.keys()), key="search_reader")
+        st.markdown("#### 2단계. 이 책을 읽을 러너를 선택하세요")
+        st.caption("검색 결과에서 책장에 추가하면, 아래에서 선택한 러너의 책장에 바로 연결됩니다.")
+        selected_reader_label = st.selectbox("읽을 러너", list(m_options.keys()), key="search_reader")
         selected_reader_id = m_options[selected_reader_label]
 
         if search_submitted:
@@ -971,7 +1448,7 @@ def page_book_search(data: dict) -> None:
             st.markdown("#### 3단계. 원하는 책을 선택해 책장에 추가하세요")
             if st.session_state.pop("scroll_to_book_results", False):
                 scroll_to_anchor("book-search-results-top")
-            st.caption(f"현재 선택된 읽는 사람: **{selected_reader_label}**")
+            st.caption(f"현재 선택된 러너: **{selected_reader_label}**")
 
             page_size = 10
             result_count = len(results)
@@ -1049,9 +1526,9 @@ def page_book_search(data: dict) -> None:
 
     else:
         st.markdown("#### 직접 등록")
-        st.caption("직접 등록할 때도 읽을 가족 구성원을 함께 선택합니다. 저장 즉시 가족 책장에 읽는 사람이 표시됩니다.")
+        st.caption("직접 등록할 때도 이 책을 읽을 러너를 함께 선택합니다. 저장 즉시 가족 책장에 읽는 러너가 표시됩니다.")
         with st.form("manual_book_form"):
-            reader_label = st.selectbox("이 책을 읽을 사람", list(m_options.keys()), key="manual_reader")
+            reader_label = st.selectbox("이 책을 읽을 러너", list(m_options.keys()), key="manual_reader")
             title = st.text_input("제목 *")
             author = st.text_input("저자")
             publisher = st.text_input("출판사")
@@ -1080,16 +1557,28 @@ def page_book_search(data: dict) -> None:
 
 def page_library(data: dict) -> None:
     st.title("📚 가족 책장")
-    st.caption("책을 추가할 때 선택한 읽는 사람이 바로 표시됩니다. 독서 기록을 아직 입력하지 않아도 가족별 책장을 확인할 수 있습니다.")
+    st.caption("책을 추가할 때 선택한 러너가 바로 표시됩니다. 독서 기록을 아직 입력하지 않아도 러너별 책장을 확인할 수 있습니다.")
     # 책장 화면은 저장 직후 갱신 UX가 중요하므로, 전달받은 data 대신 CSV를 한 번 더 읽어 최신 상태를 보장합니다.
-    books_df = read_csv("books")
+    all_books_df = read_csv("books")
     members_df = read_csv("family_members")
-    reading_logs_df = read_csv("reading_logs")
-    reviews_df = read_csv("reviews")
+    all_reading_logs_df = read_csv("reading_logs")
+    all_reviews_df = read_csv("reviews")
+    settings_df = read_csv("settings")
+
+    marathon_options = get_marathon_options(settings_df)
+    active_mid = get_active_marathon_id(settings_df)
+    option_values = list(marathon_options.values())
+    default_index = option_values.index(active_mid) if active_mid in option_values else 0
+    selected_marathon_label = st.selectbox("보기 기준", list(marathon_options.keys()), index=default_index, key="library_marathon_select")
+    selected_marathon_id = marathon_options[selected_marathon_label]
+
+    books_df = filter_by_marathon(all_books_df, selected_marathon_id)
+    reading_logs_df = filter_by_marathon(all_reading_logs_df, selected_marathon_id)
+    reviews_df = filter_by_marathon(all_reviews_df, selected_marathon_id)
     logs_df = enrich_logs(reading_logs_df, members_df, books_df)
 
     if books_df.empty:
-        st.warning("책장이 비어 있습니다. 샘플 데이터를 생성하거나 책을 등록해주세요.")
+        st.warning("선택한 독서마라톤의 책장이 비어 있습니다. 현재 active 마라톤이라면 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
         return
 
     for i in range(0, len(books_df), 2):
@@ -1117,7 +1606,7 @@ def page_library(data: dict) -> None:
                         readers = [registered_reader] if registered_reader else log_readers
                         finished = not reviews_df[(reviews_df["book_id"].astype(str) == str(book["book_id"])) & (reviews_df["member_id"].astype(str) == str(reader_id)) & (reviews_df["finished_date"].astype(str).str.len() > 0)].empty if (not reviews_df.empty and reader_id) else False
 
-                        st.markdown(f"**읽는 사람**  \n{', '.join(readers) if readers else '아직 없음'}")
+                        st.markdown(f"**읽는 러너**  \n{', '.join(readers) if readers else '아직 없음'}")
                         st.markdown(f"**상태**  \n{'✅ 완독' if finished else '📖 읽는 중'}")
                         isbn = str(book.get("isbn", "") or "").strip()
                         if isbn:
@@ -1161,13 +1650,14 @@ def page_today_reading(data: dict) -> None:
                 st.info(message)
 
     members_df = read_csv("family_members")
-    books_df = read_csv("books")
-    logs_df = read_csv("reading_logs")
-    quotes_df = read_csv("quotes")
-    reviews_df = read_csv("reviews")
+    active_mid = get_active_marathon_id(read_csv("settings"))
+    books_df = filter_by_marathon(read_csv("books"), active_mid)
+    logs_df = filter_by_marathon(read_csv("reading_logs"), active_mid)
+    quotes_df = filter_by_marathon(read_csv("quotes"), active_mid)
+    reviews_df = filter_by_marathon(read_csv("reviews"), active_mid)
 
     if members_df.empty:
-        st.warning("가족 구성원이 필요합니다. 먼저 샘플 데이터를 생성하거나 가족 구성원을 추가해주세요.")
+        st.warning("러너가 필요합니다. 먼저 샘플 데이터를 생성하거나 러너를 추가해주세요.")
         return
     if books_df.empty:
         st.warning("등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
@@ -1175,13 +1665,13 @@ def page_today_reading(data: dict) -> None:
 
     st.markdown("### 1단계. 누가 읽었나요?")
     m_options = member_options(members_df)
-    member_label = st.selectbox("가족 구성원", list(m_options.keys()), key="today_member_select")
+    member_label = st.selectbox("러너 선택", list(m_options.keys()), key="today_member_select")
     member_id = m_options[member_label]
 
     st.markdown("### 2단계. 어떤 책을 읽었나요?")
     all_member_books_options = book_options_for_member(books_df, member_id, reviews_df=reviews_df, include_finished=True)
     if not all_member_books_options:
-        st.info("이 구성원의 책장에 등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
+        st.info("이 러너의 책장에 등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
         return
 
     show_finished_books = st.checkbox("완독한 책도 보기", value=False, key=f"today_show_finished_{member_id}")
@@ -1332,6 +1822,7 @@ def page_today_reading(data: dict) -> None:
         weight = safe_float(member_row["weight"], 1.0)
         log_row = {
             "log_id": make_id("log"),
+            "marathon_id": active_mid,
             "member_id": member_id,
             "book_id": book_id,
             "reading_date": reading_date.isoformat(),
@@ -1342,13 +1833,15 @@ def page_today_reading(data: dict) -> None:
             "memo": memo,
             "created_at": now_str(),
         }
-        logs_df = pd.concat([logs_df, pd.DataFrame([log_row])], ignore_index=True)
-        write_csv("reading_logs", logs_df)
+        original_logs_df = read_csv("reading_logs")
+        original_logs_df = pd.concat([original_logs_df, pd.DataFrame([log_row])], ignore_index=True)
+        write_csv("reading_logs", original_logs_df)
 
         saved_quote = False
         if add_quote:
             quote_row = {
                 "quote_id": make_id("quote"),
+                "marathon_id": active_mid,
                 "member_id": member_id,
                 "book_id": book_id,
                 "page_number": safe_int(quote_page, 0),
@@ -1356,14 +1849,16 @@ def page_today_reading(data: dict) -> None:
                 "comment": quote_comment,
                 "created_at": now_str(),
             }
-            quotes_df = pd.concat([quotes_df, pd.DataFrame([quote_row])], ignore_index=True)
-            write_csv("quotes", quotes_df)
+            original_quotes_df = read_csv("quotes")
+            original_quotes_df = pd.concat([original_quotes_df, pd.DataFrame([quote_row])], ignore_index=True)
+            write_csv("quotes", original_quotes_df)
             saved_quote = True
 
         saved_review = False
         if finished:
             review_row = {
                 "review_id": make_id("review"),
+                "marathon_id": active_mid,
                 "member_id": member_id,
                 "book_id": book_id,
                 "rating": safe_int(rating, 5),
@@ -1372,8 +1867,9 @@ def page_today_reading(data: dict) -> None:
                 "finished_date": finished_date_value.isoformat(),
                 "created_at": now_str(),
             }
-            reviews_df = pd.concat([reviews_df, pd.DataFrame([review_row])], ignore_index=True)
-            write_csv("reviews", reviews_df)
+            original_reviews_df = read_csv("reviews")
+            original_reviews_df = pd.concat([original_reviews_df, pd.DataFrame([review_row])], ignore_index=True)
+            write_csv("reviews", original_reviews_df)
             saved_review = True
 
         messages = [
@@ -1389,12 +1885,15 @@ def page_today_reading(data: dict) -> None:
         st.rerun()
 
 
-def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
+def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
     delete_feedback = st.session_state.pop("reading_log_delete_feedback", None)
     if delete_feedback:
         st.success(delete_feedback)
 
-    logs_df = enrich_logs(read_csv("reading_logs"), members_df, books_df)
+    raw_logs_df = read_csv("reading_logs")
+    if marathon_id:
+        raw_logs_df = filter_by_marathon(raw_logs_df, marathon_id)
+    logs_df = enrich_logs(raw_logs_df, members_df, books_df)
     if logs_df.empty:
         st.write("아직 입력된 독서 기록이 없습니다.")
         return
@@ -1445,8 +1944,10 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) ->
                         st.rerun()
 
 
-def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
+def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
     quotes_df = read_csv("quotes")
+    if marathon_id:
+        quotes_df = filter_by_marathon(quotes_df, marathon_id)
     if quotes_df.empty:
         st.write("아직 저장된 문장이 없습니다.")
         return
@@ -1459,8 +1960,10 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
                 st.write(comment)
 
 
-def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
+def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
     reviews_df = read_csv("reviews")
+    if marathon_id:
+        reviews_df = filter_by_marathon(reviews_df, marathon_id)
     if reviews_df.empty:
         st.write("아직 저장된 감상이 없습니다.")
         return
@@ -1478,123 +1981,319 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None
 
 def page_records(data: dict) -> None:
     st.title("🗂️ 기록 모아보기")
-    st.caption("입력된 독서 기록, 좋았던 문장, 한 줄 감상을 한곳에서 확인합니다.")
+    st.caption("선택한 독서마라톤의 독서 기록, 좋았던 문장, 한 줄 감상을 한곳에서 확인합니다.")
+
+    settings_df = read_csv("settings")
+    marathon_options = get_marathon_options(settings_df)
+    active_mid = get_active_marathon_id(settings_df)
+    option_values = list(marathon_options.values())
+    default_index = option_values.index(active_mid) if active_mid in option_values else 0
+    selected_label = st.selectbox("보기 기준", list(marathon_options.keys()), index=default_index, key="records_marathon_select")
+    selected_mid = marathon_options[selected_label]
 
     members_df = read_csv("family_members")
-    books_df = read_csv("books")
+    books_df = filter_by_marathon(read_csv("books"), selected_mid)
     tab_logs, tab_quotes, tab_reviews = st.tabs(["독서 기록", "좋았던 문장", "한 줄 감상"])
     with tab_logs:
-        render_reading_logs_tab(members_df, books_df)
+        render_reading_logs_tab(members_df, books_df, selected_mid)
     with tab_quotes:
-        render_quotes_tab(members_df, books_df)
+        render_quotes_tab(members_df, books_df, selected_mid)
     with tab_reviews:
-        render_reviews_tab(members_df, books_df)
+        render_reviews_tab(members_df, books_df, selected_mid)
 
 
 def page_monthly_report(data: dict) -> None:
     st.title("📊 월간 리포트")
-    summary = calculate_summary(data)
-    settings = summary["settings"]
+    st.caption("선택한 독서마라톤 기준으로 가족 독서 기록을 정리합니다.")
+
+    settings_df = read_csv("settings")
+    marathon_options = get_marathon_options(settings_df)
+    active_mid = get_active_marathon_id(settings_df)
+    option_values = list(marathon_options.values())
+    default_index = option_values.index(active_mid) if active_mid in option_values else 0
+    selected_label = st.selectbox("리포트 기준", list(marathon_options.keys()), index=default_index, key="report_marathon_select")
+    selected_mid = marathon_options[selected_label]
+    selected_settings = get_marathon_by_id(settings_df, selected_mid)
+
+    scoped_data = scoped_data_for_marathon(load_all_data(), selected_mid)
+    summary = calculate_summary(scoped_data)
+    summary["settings"] = selected_settings
     logs_df = summary["logs"]
-    members_df = data["family_members"]
-    books_df = data["books"]
-    reviews_df = data["reviews"]
-    quotes_df = data["quotes"]
+    members_df = scoped_data["family_members"]
+    books_df = scoped_data["books"]
+    reviews_df = scoped_data["reviews"]
+    quotes_df = scoped_data["quotes"]
 
-    report_month = st.date_input("리포트 기준 월", value=date(2026, 7, 1))
-    month_start = pd.Timestamp(report_month.replace(day=1))
-    next_month = (month_start + pd.offsets.MonthBegin(1))
-
-    if logs_df.empty:
-        month_logs = logs_df
-    else:
-        month_logs = logs_df[(logs_df["reading_date_dt"] >= month_start) & (logs_df["reading_date_dt"] < next_month)]
-
-    month_total = float(month_logs["weighted_pages"].sum()) if not month_logs.empty else 0.0
-    target = safe_int(settings.get("family_target_pages"), 0)
+    month_total = float(logs_df["weighted_pages"].sum()) if not logs_df.empty else 0.0
+    target = safe_int(selected_settings.get("family_target_pages"), 0)
     rate = month_total / target * 100 if target > 0 else 0
-    stats = get_member_stats(month_logs, members_df)
+    stats = get_member_stats(logs_df, members_df)
 
     top_reader = stats.iloc[0]["member_name"] if not stats.empty and stats.iloc[0]["weighted_pages"] > 0 else "아직 없음"
     steady = stats.sort_values(["record_days", "weighted_pages"], ascending=False).iloc[0]["member_name"] if not stats.empty and stats["record_days"].max() > 0 else "아직 없음"
 
-    finished_reviews = reviews_df[reviews_df["finished_date"].astype(str).str.startswith(report_month.strftime("%Y-%m"), na=False)] if not reviews_df.empty else reviews_df
+    finished_reviews = reviews_df[reviews_df["finished_date"].astype(str).str.strip().str.len() > 0] if not reviews_df.empty else reviews_df
     finished_books = [get_book_title(book_id, books_df) for book_id in finished_reviews["book_id"].dropna().unique()] if not finished_reviews.empty else []
 
-    month_quotes = quotes_df.copy()
     quote_text = "아직 선정된 문장이 없습니다."
-    if not month_quotes.empty:
-        quote_text = str(month_quotes.sort_values("created_at", ascending=False).iloc[0]["quote_text"])
+    if not quotes_df.empty:
+        quote_text = str(quotes_df.sort_values("created_at", ascending=False).iloc[0]["quote_text"])
 
+    st.info(f"{selected_settings['marathon_name']} · {selected_settings['start_date']} ~ {selected_settings['end_date']}")
     col1, col2, col3 = st.columns(3)
-    col1.metric("이번 달 총 페이지", f"{month_total:,.1f}")
+    col1.metric("마라톤 총 페이지", f"{month_total:,.1f}")
     col2.metric("목표 달성률", f"{rate:.1f}%")
     col3.metric("완독한 책", f"{len(finished_books)}권")
 
-    st.subheader("구성원별 누적 페이지")
+    st.subheader("러너별 누적 페이지")
     if stats.empty:
         st.write("데이터가 없습니다.")
     else:
-        st.dataframe(stats.rename(columns={"member_name": "구성원", "pages_read": "실제 페이지", "weighted_pages": "가중치 페이지", "record_days": "기록일 수"})[["구성원", "실제 페이지", "가중치 페이지", "기록일 수"]], use_container_width=True, hide_index=True)
+        st.dataframe(stats.rename(columns={"member_name": "러너", "pages_read": "실제 페이지", "weighted_pages": "가중치 페이지", "record_days": "기록일 수"})[["러너", "실제 페이지", "가중치 페이지", "기록일 수"]], use_container_width=True, hide_index=True)
 
-    st.subheader("이달의 요약")
+    st.subheader("마라톤 요약")
     finished_text = ", ".join(finished_books) if finished_books else "아직 완독 기록은 없습니다"
     auto_summary = (
-        f"이번 달 우리 가족은 총 {month_total:,.1f}페이지를 읽었습니다. "
+        f"이번 독서마라톤에서 우리 가족은 총 {month_total:,.1f}페이지를 읽었습니다. "
         f"목표 {target:,}페이지 중 {rate:.1f}%를 달성했습니다. "
-        f"가장 많이 읽은 사람은 {top_reader}이고, 가장 꾸준히 기록한 사람은 {steady}입니다. "
-        f"완독한 책은 {finished_text}. 이달의 문장은 ‘{quote_text}’입니다."
+        f"가장 많이 보탠 러너는 {top_reader}이고, 가장 꾸준히 기록한 러너는 {steady}입니다. "
+        f"완독한 책은 {finished_text}. 이 마라톤의 문장은 ‘{quote_text}’입니다."
     )
     st.success(auto_summary)
 
     with st.container(border=True):
         st.markdown("#### 🏅 리포트 상세")
-        st.write(f"- 가장 많이 읽은 사람: **{top_reader}**")
-        st.write(f"- 가장 꾸준히 기록한 사람: **{steady}**")
+        st.write(f"- 가장 많이 보탠 러너: **{top_reader}**")
+        st.write(f"- 가장 꾸준히 기록한 러너: **{steady}**")
         st.write(f"- 완독한 책: **{finished_text}**")
-        st.write(f"- 이달의 문장: “{quote_text}”")
-
+        st.write(f"- 이 마라톤의 문장: “{quote_text}”")
 
 def page_settings(data: dict) -> None:
-    st.title("⚙️ 마라톤 설정 / 가족 구성원")
-    settings = get_settings(data["settings"])
+    st.title("⚙️ 마라톤 설정 / 러너 관리")
+    st.caption("가족 구성원을 러너로 등록해 독서마라톤에 함께 참여할 수 있습니다.")
+    settings_df = read_csv("settings")
+    settings = get_active_marathon(settings_df)
+
+    st.subheader("🏁 현재 진행 중인 독서마라톤")
+    st.info(f"{settings['marathon_name']} · {settings['start_date']} ~ {settings['end_date']}")
     with st.form("settings_form"):
         marathon_name = st.text_input("마라톤 이름", value=settings["marathon_name"])
         start_date = st.date_input("시작일", value=pd.to_datetime(settings["start_date"]).date())
         end_date = st.date_input("종료일", value=pd.to_datetime(settings["end_date"]).date())
         family_target_pages = st.number_input("가족 목표 페이지", min_value=1, step=100, value=safe_int(settings["family_target_pages"], 2000))
         unit_name = st.text_input("단위명", value=settings["unit_name"])
-        submitted = st.form_submit_button("설정 저장")
+        submitted = st.form_submit_button("현재 마라톤 설정 저장")
     if submitted:
-        write_csv("settings", pd.DataFrame([{
-            "marathon_name": marathon_name,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "family_target_pages": family_target_pages,
-            "unit_name": unit_name,
-        }], columns=CSV_COLUMNS["settings"]))
-        st.success("설정을 저장했습니다.")
-        st.rerun()
-
-    st.subheader("가족 구성원 추가")
-    with st.form("member_form"):
-        col1, col2 = st.columns(2)
-        name = col1.text_input("이름")
-        avatar = col2.text_input("이모지", value="🙂")
-        role = st.text_input("역할", placeholder="예: 기록왕, 그림책 러너")
-        age_group = st.selectbox("연령대", ["성인", "초등", "유아", "기타"])
-        weight = st.number_input("가중치", min_value=0.1, max_value=5.0, step=0.1, value=1.0)
-        member_submit = st.form_submit_button("구성원 추가")
-    if member_submit:
-        if not name.strip():
-            st.error("이름을 입력해주세요.")
+        latest_settings = read_csv("settings")
+        active_id = settings["marathon_id"]
+        mask = latest_settings["marathon_id"].astype(str) == str(active_id)
+        if not mask.any():
+            st.warning("수정할 active 마라톤을 찾지 못했습니다.")
         else:
-            row = {"member_id": make_id("member"), "name": name, "role": role, "age_group": age_group, "weight": weight, "avatar": avatar, "created_at": now_str()}
-            members_df = pd.concat([data["family_members"], pd.DataFrame([row])], ignore_index=True)
-            write_csv("family_members", members_df)
-            st.success("가족 구성원을 추가했습니다.")
+            latest_settings.loc[mask, "marathon_name"] = marathon_name
+            latest_settings.loc[mask, "start_date"] = start_date.isoformat()
+            latest_settings.loc[mask, "end_date"] = end_date.isoformat()
+            latest_settings.loc[mask, "family_target_pages"] = family_target_pages
+            latest_settings.loc[mask, "unit_name"] = unit_name
+            write_csv("settings", latest_settings)
+            st.success("현재 독서마라톤 설정을 저장했습니다.")
             st.rerun()
 
+    st.subheader("🆕 새 독서마라톤 시작")
+    st.caption("기존 기록은 보존하고, 새 목표와 새 책장으로 다음 독서마라톤을 시작합니다. 러너 정보는 그대로 유지됩니다.")
+    st.info("기본값은 가족 월간 목표 2,000쪽입니다. 성인은 월 2권을 기본 페이스, 월 4권은 주 1권 챌린지로 생각하면 좋습니다.")
+    marathon_defaults = get_next_marathon_defaults(settings_df)
+    with st.form("new_marathon_form"):
+        new_name = st.text_input("새 마라톤 이름", value=marathon_defaults["name"])
+        c1, c2 = st.columns(2)
+        new_start = c1.date_input("시작일", value=marathon_defaults["start_date"], key="new_marathon_start")
+        new_end_default = (pd.Timestamp(new_start) + pd.offsets.MonthEnd(0)).date()
+        new_end = c2.date_input("종료일", value=new_end_default, key="new_marathon_end")
+        new_target = st.number_input("가족 목표 페이지", min_value=1, step=100, value=marathon_defaults["target"], key="new_marathon_target")
+        new_unit = st.text_input("단위명", value=marathon_defaults["unit"], key="new_marathon_unit")
+        new_submitted = st.form_submit_button("새 마라톤 시작하기", type="primary")
+    if new_submitted:
+        if new_end < new_start:
+            st.error("종료일은 시작일보다 빠를 수 없습니다.")
+        else:
+            new_id = start_new_marathon(new_name, new_start, new_end, new_target, new_unit)
+            st.success(f"새 독서마라톤을 시작했습니다. 새 마라톤 ID: {new_id}")
+            st.rerun()
+
+    with st.expander("📚 보존된 독서마라톤 목록 / 선택 / 삭제", expanded=False):
+        marathon_list = read_csv("settings")
+        if marathon_list.empty:
+            st.write("아직 저장된 마라톤이 없습니다.")
+        else:
+            display_df = marathon_list.copy()
+            display_df["상태"] = display_df["is_active"].apply(lambda x: "진행 중" if normalize_bool(x) else "보관")
+            st.dataframe(
+                display_df.rename(columns={
+                    "marathon_name": "마라톤 이름",
+                    "start_date": "시작일",
+                    "end_date": "종료일",
+                    "family_target_pages": "목표 페이지",
+                    "unit_name": "단위",
+                })[["상태", "마라톤 이름", "시작일", "종료일", "목표 페이지", "단위"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            marathon_options = get_marathon_options(marathon_list)
+            active_mid = get_active_marathon_id(marathon_list)
+            labels = list(marathon_options.keys())
+            values = list(marathon_options.values())
+            default_idx = values.index(active_mid) if active_mid in values else 0
+            selected_label = st.selectbox("관리할 독서마라톤 선택", labels, index=default_idx, key="manage_marathon_select")
+            selected_mid = marathon_options[selected_label]
+            selected_is_active = selected_mid == active_mid
+            c1, c2 = st.columns(2)
+            if c1.button("이 마라톤을 진행 중으로 선택", disabled=selected_is_active, key="set_active_marathon_button"):
+                set_active_marathon(selected_mid)
+                st.success("선택한 독서마라톤을 현재 진행 중으로 변경했습니다.")
+                st.rerun()
+
+            delete_key = "pending_delete_marathon_id"
+            pending_delete_mid = st.session_state.get(delete_key)
+            if pending_delete_mid == selected_mid:
+                st.warning("정말 이 독서마라톤을 삭제할까요? 러너는 유지되지만, 이 마라톤의 책장·독서 기록·문장·완독 감상은 함께 삭제됩니다.")
+                d1, d2 = st.columns(2)
+                if d1.button("삭제 확인", key="confirm_delete_marathon", type="primary"):
+                    result = delete_marathon_and_related_data(selected_mid)
+                    st.session_state.pop(delete_key, None)
+                    if result.get("error"):
+                        st.error(result["error"])
+                    else:
+                        st.success(
+                            f"독서마라톤을 삭제했습니다. 함께 정리된 항목: "
+                            f"책장 {result['books']}개, 독서 기록 {result['logs']}개, "
+                            f"좋았던 문장 {result['quotes']}개, 완독 감상 {result['reviews']}개"
+                        )
+                    st.rerun()
+                if d2.button("취소", key="cancel_delete_marathon"):
+                    st.session_state.pop(delete_key, None)
+                    st.info("독서마라톤 삭제를 취소했습니다.")
+                    st.rerun()
+            else:
+                if c2.button("이 마라톤 삭제", key="request_delete_marathon"):
+                    st.session_state[delete_key] = selected_mid
+                    st.rerun()
+
+    st.subheader("🏃 새 러너 추가")
+    st.caption("러너 유형에 따라 기본 가중치가 제안됩니다. 가중치는 필요하면 직접 수정할 수 있습니다.")
+    new_runner_age = st.selectbox("러너 유형", AGE_GROUP_OPTIONS, index=0, key="new_runner_age_group_select")
+    with st.form("member_form"):
+        col1, col2 = st.columns(2)
+        name = col1.text_input("러너 이름")
+        avatar = col2.selectbox("이모지/avatar", EMOJI_OPTIONS, index=0)
+        role = st.text_input("역할", placeholder="예: 기록왕, 그림책 러너")
+        age_group = new_runner_age
+        weight = st.number_input(
+            "가중치",
+            min_value=0.1,
+            max_value=5.0,
+            step=0.1,
+            value=float(recommended_weight(age_group)),
+            key=f"new_runner_weight_{age_group}",
+            help="기본값: 성인 1.0, 청소년 1.1, 어린이 1.4, 유아 2.0",
+        )
+        member_submit = st.form_submit_button("새 러너 추가")
+    if member_submit:
+        if not name.strip():
+            st.error("러너 이름을 입력해주세요.")
+        else:
+            row = {
+                "member_id": make_id("member"),
+                "name": name.strip(),
+                "role": role.strip(),
+                "age_group": age_group,
+                "weight": weight,
+                "avatar": avatar,
+                "created_at": now_str(),
+            }
+            members_df = pd.concat([read_csv("family_members"), pd.DataFrame([row])], ignore_index=True)
+            write_csv("family_members", members_df)
+            st.success("새 러너를 추가했습니다.")
+            st.rerun()
+
+    st.subheader("🏃 현재 함께 달리는 러너")
+    members_df = read_csv("family_members")
+    if members_df.empty:
+        st.write("아직 등록된 러너가 없습니다.")
+    else:
+        st.dataframe(members_df[["avatar", "name", "role", "age_group", "weight"]], use_container_width=True, hide_index=True)
+        st.caption("러너 정보를 수정하면 홈 대시보드, 책장, 오늘의 독서 기록 화면에 바로 반영됩니다.")
+        for _, member in members_df.iterrows():
+            member_id = str(member.get("member_id", ""))
+            current_avatar = str(member.get("avatar", "") or "👨").strip()
+            avatar_options = emoji_options_with_current(current_avatar)
+            current_index = avatar_options.index(current_avatar) if current_avatar in avatar_options else 0
+            with st.expander(f"{current_avatar} {member.get('name', '러너')} 러너 정보 수정", expanded=False):
+                with st.form(f"edit_member_form_{member_id}"):
+                    col1, col2 = st.columns(2)
+                    edited_name = col1.text_input("이름", value=str(member.get("name", "")), key=f"edit_name_{member_id}")
+                    edited_avatar = col2.selectbox("이모지/avatar", avatar_options, index=current_index, key=f"edit_avatar_{member_id}")
+                    edited_role = st.text_input("역할", value=str(member.get("role", "")), key=f"edit_role_{member_id}")
+                    age_options = AGE_GROUP_OPTIONS
+                    current_age = normalize_age_group(member.get("age_group", "성인"))
+                    edited_age_group = st.selectbox(
+                        "러너 유형",
+                        age_options,
+                        index=age_options.index(current_age) if current_age in age_options else 0,
+                        key=f"edit_age_group_{member_id}",
+                    )
+                    edited_weight = st.number_input(
+                        "가중치",
+                        min_value=0.1,
+                        max_value=5.0,
+                        step=0.1,
+                        value=safe_float(member.get("weight", 1.0), 1.0),
+                        key=f"edit_weight_{member_id}",
+                    )
+                    edit_submitted = st.form_submit_button("러너 정보 저장")
+                if edit_submitted:
+                    if not edited_name.strip():
+                        st.error("러너 이름을 입력해주세요.")
+                    else:
+                        latest_members = read_csv("family_members")
+                        mask = latest_members["member_id"].astype(str) == member_id
+                        if not mask.any():
+                            st.warning("수정할 러너를 찾지 못했습니다.")
+                        else:
+                            latest_members.loc[mask, "name"] = edited_name.strip()
+                            latest_members.loc[mask, "avatar"] = edited_avatar
+                            latest_members.loc[mask, "role"] = edited_role.strip()
+                            latest_members.loc[mask, "age_group"] = edited_age_group
+                            latest_members.loc[mask, "weight"] = edited_weight
+                            write_csv("family_members", latest_members)
+                            st.success("러너 정보를 저장했습니다.")
+                            st.rerun()
+
+                st.divider()
+                st.markdown("**러너 삭제**")
+                st.caption("테스트로 추가한 러너를 정리할 수 있습니다. 삭제하면 해당 러너의 책장, 독서 기록, 좋았던 문장, 완독 감상도 함께 삭제됩니다.")
+                delete_state_key = "pending_delete_runner_id"
+                pending_delete_id = st.session_state.get(delete_state_key)
+
+                if pending_delete_id == member_id:
+                    st.warning(f"정말 {current_avatar} {member.get('name', '러너')} 러너를 삭제할까요? 이 작업은 되돌릴 수 없습니다.")
+                    c1, c2 = st.columns(2)
+                    if c1.button("삭제 확인", key=f"confirm_delete_member_{member_id}", type="primary"):
+                        result = delete_runner_and_related_data(member_id)
+                        st.session_state.pop(delete_state_key, None)
+                        st.success(
+                            f"러너를 삭제했습니다. "
+                            f"함께 정리된 항목: 책장 {result['books']}개, 독서 기록 {result['logs']}개, "
+                            f"좋았던 문장 {result['quotes']}개, 완독 감상 {result['reviews']}개"
+                        )
+                        st.rerun()
+                    if c2.button("취소", key=f"cancel_delete_member_{member_id}"):
+                        st.session_state.pop(delete_state_key, None)
+                        st.info("러너 삭제를 취소했습니다.")
+                        st.rerun()
+                else:
+                    if st.button("이 러너 삭제", key=f"request_delete_member_{member_id}"):
+                        st.session_state[delete_state_key] = member_id
+                        st.rerun()
 
     st.subheader("국립중앙도서관 페이지 수 조회 테스트")
     st.caption("선택 기능입니다. 책장 추가 시에는 자동 호출하지 않으며, 이 테스트 버튼을 눌렀을 때만 5초 이내 timeout으로 수동 조회합니다.")
@@ -1624,23 +2323,18 @@ def page_settings(data: dict) -> None:
                     if debug.get("response_preview"):
                         st.text_area("응답 미리보기", value=str(debug.get("response_preview"))[:1000], height=160, disabled=True)
 
-    st.subheader("현재 가족 구성원")
-    if data["family_members"].empty:
-        st.write("아직 구성원이 없습니다.")
-    else:
-        st.dataframe(data["family_members"][["avatar", "name", "role", "age_group", "weight"]], use_container_width=True, hide_index=True)
-
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
     ensure_csv_files()
+    migrate_data_schema()
     data = load_all_data()
 
     with st.sidebar:
         st.title("📚 독서마라톤")
         page = st.radio(
             "메뉴",
-            ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "오늘의 독서 기록", "기록 모아보기", "월간 리포트", "설정 / 가족 구성원"],
+            ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "오늘의 독서 기록", "기록 모아보기", "월간 리포트", "설정 / 러너 관리"],
         )
         st.divider()
         st.caption("CSV 저장 방식 MVP")
@@ -1658,7 +2352,7 @@ def main() -> None:
         page_records(data)
     elif page == "월간 리포트":
         page_monthly_report(data)
-    elif page == "설정 / 가족 구성원":
+    elif page == "설정 / 러너 관리":
         page_settings(data)
 
 
