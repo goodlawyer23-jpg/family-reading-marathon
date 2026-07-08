@@ -10,7 +10,7 @@
 
 ## 🔗 바로가기
 
-- **Streamlit 앱 실행하기:** `https://family-reading-marathon.streamlit.app/`
+- **Streamlit 앱 실행하기:** [`https://family-reading-marathon.streamlit.app/`](https://family-reading-marathon.streamlit.app/)
 - **프로젝트 발표 자료:** [`docs/PRESENTATION_OUTLINE.md`](docs/PRESENTATION_OUTLINE.md)
 - **프로젝트 브리프:** [`docs/PROJECT_BRIEF.md`](docs/PROJECT_BRIEF.md)
 - **MVP 명세:** [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md)
