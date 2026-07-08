@@ -11,6 +11,8 @@
 ## 🔗 바로가기
 
 - **Streamlit 앱 실행하기:** https://family-reading-marathon.streamlit.app/
+- **GitHub Pages 소개 페이지:** https://goodlawyer23-jpg.github.io/family-reading-marathon/
+- **GitHub 저장소:** https://github.com/goodlawyer23-jpg/family-reading-marathon
 - **프로젝트 발표 자료:** [`docs/PRESENTATION_OUTLINE.md`](docs/PRESENTATION_OUTLINE.md)
 - **프로젝트 브리프:** [`docs/PROJECT_BRIEF.md`](docs/PROJECT_BRIEF.md)
 - **MVP 명세:** [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md)
@@ -192,6 +194,7 @@ family-reading-marathon/
     sample_books.csv
 
   docs/
+    index.html
     PROJECT_BRIEF.md
     MVP_SPEC.md
     DEV_LOG.md
@@ -229,9 +232,35 @@ https://family-reading-marathon.streamlit.app/
 
 Streamlit Community Cloud에 배포된 공개 앱입니다. 일부 자동 평가 도구에서는 Streamlit 인증 리다이렉트가 발생할 수 있으므로, 접속이 안 될 경우 일반 브라우저에서 직접 열어 확인해 주세요.
 
+
 ---
 
-## 10. API 사용 방식
+## 10. GitHub Pages 소개 페이지
+
+Streamlit 앱이 일부 자동 평가 도구나 봇 환경에서 인증 리다이렉트로 바로 열리지 않을 수 있어, 정적 소개 페이지를 별도로 제공합니다.
+
+```text
+https://goodlawyer23-jpg.github.io/family-reading-marathon/
+```
+
+이 페이지는 `docs/index.html`로 구성되어 있으며, 서비스 목적, 핵심 기능, 데모 시나리오, 화면 캡처, 기술 스택을 정적으로 확인할 수 있습니다.
+
+### GitHub Pages 설정 방법
+
+GitHub 저장소에서 아래 순서로 설정합니다.
+
+1. 저장소 상단의 **Settings**로 이동합니다.
+2. 왼쪽 메뉴에서 **Pages**를 선택합니다.
+3. **Build and deployment** 항목에서 Source를 **Deploy from a branch**로 선택합니다.
+4. Branch를 `main`, 폴더를 `/docs`로 선택합니다.
+5. **Save**를 누릅니다.
+6. 몇 분 뒤 `https://goodlawyer23-jpg.github.io/family-reading-marathon/` 주소에서 정적 소개 페이지를 확인합니다.
+
+> GitHub Pages는 `docs/index.html`을 기준으로 정적 페이지를 표시합니다. 화면 캡처 이미지는 `docs/images/` 폴더에 두면 됩니다.
+
+---
+
+## 17. API 사용 방식
 
 ### 네이버 책 검색 API
 
@@ -275,7 +304,7 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 11. 추천 데모 시나리오
+## 17. 추천 데모 시나리오
 
 심사 또는 발표 시 아래 순서로 시연할 수 있습니다.
 
@@ -334,9 +363,9 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 12. 화면 캡처
+## 17. 화면 캡처
 
-아래 영역에 실제 앱 화면 캡처를 확인할 수 있습니다. GitHub README만으로도 서비스 흐름을 이해할 수 있습니다.
+아래 영역에 실제 앱 화면 캡처를 추가하면 GitHub README만으로도 서비스 흐름을 이해할 수 있습니다.
 
 이미지는 `docs/images/` 폴더에 넣는 것을 권장합니다.
 
@@ -370,7 +399,7 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 13. MVP 구현 범위
+## 17. MVP 구현 범위
 
 이번 버전은 가족 사용을 위한 1차 MVP입니다.
 
@@ -402,7 +431,7 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 14. 향후 확장 방향
+## 17. 향후 확장 방향
 
 ### 데이터 저장 확장
 
@@ -447,7 +476,7 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 15. 프로젝트의 차별점
+## 17. 프로젝트의 차별점
 
 이 프로젝트는 단순한 독서 기록장이 아니라, 가족이 함께 쓰는 협동형 독서마라톤입니다.
 
@@ -460,7 +489,7 @@ API 키가 없거나 API 호출에 실패해도 앱이 중단되지 않습니다
 
 ---
 
-## 16. 개발 목적
+## 17. 개발 목적
 
 이 프로젝트의 목표는 거대한 플랫폼을 만드는 것이 아니라, 가족이 실제 생활에서 사용할 수 있는 작은 웹앱을 빠르게 만들고, 기능이 실제로 작동하는 MVP로 구현하는 것입니다.
 
