@@ -1265,6 +1265,89 @@ def get_book_progress(book_id: str, books_df: pd.DataFrame, logs_df: pd.DataFram
     return pages_sum, total_pages, progress
 
 
+def count_book_related_records(book_id: str, marathon_id: str | None = None) -> dict:
+    """책장 항목에 연결된 기록 수를 확인합니다.
+
+    book_id는 기본적으로 고유하지만, 마라톤별 책장 구조를 안전하게 유지하기 위해
+    marathon_id가 주어지면 해당 마라톤 범위 안에서만 확인합니다.
+    """
+    book_id = str(book_id).strip()
+    marathon_id = str(marathon_id or "").strip()
+    counts = {"logs": 0, "quotes": 0, "reviews": 0, "total": 0}
+    for csv_key, count_key in [("reading_logs", "logs"), ("quotes", "quotes"), ("reviews", "reviews")]:
+        df = read_csv(csv_key)
+        if df.empty or "book_id" not in df.columns:
+            continue
+        target = df["book_id"].astype(str).str.strip() == book_id
+        if marathon_id and "marathon_id" in df.columns:
+            target = target & (df["marathon_id"].astype(str).str.strip() == marathon_id)
+        counts[count_key] = int(target.sum())
+    counts["total"] = counts["logs"] + counts["quotes"] + counts["reviews"]
+    return counts
+
+
+def remove_book_from_library(book_id: str, marathon_id: str | None = None) -> tuple[bool, str]:
+    """기록이 없는 책장 항목만 제거합니다."""
+    book_id = str(book_id).strip()
+    marathon_id = str(marathon_id or "").strip()
+    counts = count_book_related_records(book_id, marathon_id)
+    if counts["total"] > 0:
+        return False, "이 책에는 독서 기록이 있어 바로 제거할 수 없습니다. 먼저 기록 모아보기에서 관련 기록을 삭제해주세요."
+
+    books_df = read_csv("books")
+    if books_df.empty or "book_id" not in books_df.columns:
+        return False, "제거할 책을 찾지 못했습니다."
+    mask = books_df["book_id"].astype(str).str.strip() == book_id
+    if marathon_id and "marathon_id" in books_df.columns:
+        mask = mask & (books_df["marathon_id"].astype(str).str.strip() == marathon_id)
+    if not mask.any():
+        return False, "제거할 책을 찾지 못했습니다."
+    books_df = books_df.loc[~mask].copy()
+    write_csv("books", books_df)
+    st.session_state["books_csv_updated_at"] = now_str()
+    return True, "책장에서 제거했습니다."
+
+
+def update_book_reader(book_id: str, new_reader_member_id: str, marathon_id: str | None = None) -> tuple[bool, str]:
+    """기록이 없는 책장 항목의 읽는 러너를 변경합니다."""
+    book_id = str(book_id).strip()
+    new_reader_member_id = str(new_reader_member_id or "").strip()
+    marathon_id = str(marathon_id or "").strip()
+    if not new_reader_member_id:
+        return False, "변경할 러너를 선택해주세요."
+
+    counts = count_book_related_records(book_id, marathon_id)
+    if counts["total"] > 0:
+        return False, "이미 독서 기록이 있는 책은 러너를 변경할 수 없습니다."
+
+    books_df = read_csv("books")
+    if books_df.empty or "book_id" not in books_df.columns:
+        return False, "변경할 책을 찾지 못했습니다."
+    current_mask = books_df["book_id"].astype(str).str.strip() == book_id
+    if marathon_id and "marathon_id" in books_df.columns:
+        current_mask = current_mask & (books_df["marathon_id"].astype(str).str.strip() == marathon_id)
+    if not current_mask.any():
+        return False, "변경할 책을 찾지 못했습니다."
+
+    current_row = books_df.loc[current_mask].iloc[0].to_dict()
+    current_reader_id = str(current_row.get("reader_member_id", "") or "").strip()
+    if current_reader_id == new_reader_member_id:
+        return False, "이미 선택한 러너의 책장에 등록되어 있습니다."
+
+    scoped_books_df = filter_by_marathon(books_df, marathon_id) if marathon_id else books_df.copy()
+    duplicate_mask = same_book_mask(scoped_books_df, current_row)
+    if len(duplicate_mask) == len(scoped_books_df) and duplicate_mask.any():
+        same_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == new_reader_member_id
+        same_book_same_reader = scoped_books_df[duplicate_mask & same_reader_mask & (scoped_books_df["book_id"].astype(str).str.strip() != book_id)]
+        if not same_book_same_reader.empty:
+            return False, "변경하려는 러너의 책장에 이미 같은 책이 있습니다."
+
+    books_df.loc[current_mask, "reader_member_id"] = new_reader_member_id
+    write_csv("books", books_df)
+    st.session_state["books_csv_updated_at"] = now_str()
+    return True, "읽는 러너를 변경했습니다."
+
+
 def render_metric_cards(summary: dict) -> None:
     settings = summary["settings"]
     unit = display_unit(settings.get("unit_name", "페이지"))
@@ -1307,12 +1390,6 @@ def page_dashboard(data: dict) -> None:
     st.info(get_dashboard_encouragement(summary, member_stats_df))
     render_metric_cards(summary)
 
-    with st.expander("🛠️ 개발/시연용 도구", expanded=False):
-        st.caption("발표 시연이나 초기 테스트가 필요할 때만 사용하세요. 기존 CSV 데이터가 샘플 데이터로 초기화됩니다.")
-        if st.button("🎁 샘플 데이터 생성 / 초기화", type="primary"):
-            create_sample_data()
-            st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
-            st.rerun()
 
     if member_stats_df.empty:
         st.warning("아직 러너가 없습니다. 샘플 데이터를 생성하거나 러너를 추가해주세요.")
@@ -1577,6 +1654,16 @@ def page_library(data: dict) -> None:
     reviews_df = filter_by_marathon(all_reviews_df, selected_marathon_id)
     logs_df = enrich_logs(reading_logs_df, members_df, books_df)
 
+    library_feedback = st.session_state.pop("library_manage_feedback", None)
+    if library_feedback:
+        level, message = library_feedback
+        if level == "success":
+            st.success(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
+
     if books_df.empty:
         st.warning("선택한 독서마라톤의 책장이 비어 있습니다. 현재 active 마라톤이라면 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
         return
@@ -1628,13 +1715,85 @@ def page_library(data: dict) -> None:
                         if st.button("전체 페이지 수 저장", key=f"save_total_pages_{book['book_id']}"):
                             latest_books_df = read_csv("books")
                             mask = latest_books_df["book_id"].astype(str) == str(book["book_id"])
+                            if "marathon_id" in latest_books_df.columns:
+                                mask = mask & (latest_books_df["marathon_id"].astype(str) == str(selected_marathon_id))
                             if mask.any():
                                 latest_books_df.loc[mask, "total_pages"] = safe_int(edited_total_pages, 0)
                                 write_csv("books", latest_books_df)
-                                st.success("전체 페이지 수를 저장했습니다. 진행률을 다시 계산합니다.")
+                                st.session_state["library_manage_feedback"] = ("success", "전체 페이지 수를 저장했습니다. 진행률을 다시 계산합니다.")
                                 st.rerun()
                             else:
                                 st.warning("수정할 책을 찾지 못했습니다.")
+
+                    book_id = str(book.get("book_id", "")).strip()
+                    manage_expander_label = f"책장 관리 · {title[:14]} · {registered_reader or '러너 미지정'}" if title else "책장 관리"
+                    with st.expander(manage_expander_label, expanded=False):
+                        related_counts = count_book_related_records(book_id, selected_marathon_id)
+                        has_related_records = related_counts["total"] > 0
+
+                        if has_related_records:
+                            st.info(
+                                "이 책에는 독서 기록이 있어 바로 제거하거나 러너를 변경할 수 없습니다. "
+                                "먼저 기록 모아보기에서 관련 기록을 삭제해주세요."
+                            )
+                            st.caption(
+                                f"연결된 기록: 독서 기록 {related_counts['logs']}개 · "
+                                f"좋았던 문장 {related_counts['quotes']}개 · 완독 감상 {related_counts['reviews']}개"
+                            )
+                        else:
+                            st.caption("아직 연결된 기록이 없는 책입니다. 책장에서 제거하거나 읽는 러너를 변경할 수 있습니다.")
+
+                        st.markdown("##### 읽는 러너 변경")
+                        if has_related_records:
+                            st.caption("이미 독서 기록이 있는 책은 러너를 변경할 수 없습니다.")
+                        else:
+                            runner_options = member_options(members_df)
+                            runner_labels = list(runner_options.keys())
+                            current_reader_id = str(book.get("reader_member_id", "") or "").strip()
+                            current_index = 0
+                            for idx, label in enumerate(runner_labels):
+                                if str(runner_options[label]) == current_reader_id:
+                                    current_index = idx
+                                    break
+                            if runner_labels:
+                                selected_runner_label = st.selectbox(
+                                    "새 읽는 러너",
+                                    runner_labels,
+                                    index=current_index,
+                                    key=f"change_reader_{book_id}",
+                                )
+                                if st.button("러너 변경 저장", key=f"save_reader_{book_id}"):
+                                    ok, message = update_book_reader(book_id, runner_options[selected_runner_label], selected_marathon_id)
+                                    st.session_state["library_manage_feedback"] = ("success" if ok else "warning", message)
+                                    st.rerun()
+                            else:
+                                st.warning("등록된 러너가 없습니다.")
+
+                        st.markdown("##### 책장에서 제거")
+                        if has_related_records:
+                            st.caption("기록이 있는 책은 데이터 꼬임을 막기 위해 책장에서 바로 제거할 수 없습니다.")
+                        else:
+                            pending_remove_id = st.session_state.get("pending_remove_book_id")
+                            if pending_remove_id == book_id:
+                                st.warning("정말 이 책을 책장에서 제거할까요?")
+                                confirm_col, cancel_col = st.columns(2)
+                                with confirm_col:
+                                    if st.button("제거 확인", key=f"confirm_remove_book_{book_id}", type="primary"):
+                                        ok, message = remove_book_from_library(book_id, selected_marathon_id)
+                                        st.session_state.pop("pending_remove_book_id", None)
+                                        if ok:
+                                            st.session_state["library_manage_feedback"] = ("success", f"《{title}》을 책장에서 제거했습니다.")
+                                        else:
+                                            st.session_state["library_manage_feedback"] = ("warning", message)
+                                        st.rerun()
+                                with cancel_col:
+                                    if st.button("취소", key=f"cancel_remove_book_{book_id}"):
+                                        st.session_state.pop("pending_remove_book_id", None)
+                                        st.rerun()
+                            else:
+                                if st.button("책장에서 제거", key=f"request_remove_book_{book_id}"):
+                                    st.session_state["pending_remove_book_id"] = book_id
+                                    st.rerun()
 
 
 def page_today_reading(data: dict) -> None:
@@ -1945,38 +2104,94 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, ma
 
 
 def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
+    delete_feedback = st.session_state.pop("quote_delete_feedback", None)
+    if delete_feedback:
+        st.success(delete_feedback)
+
     quotes_df = read_csv("quotes")
     if marathon_id:
         quotes_df = filter_by_marathon(quotes_df, marathon_id)
     if quotes_df.empty:
         st.write("아직 저장된 문장이 없습니다.")
         return
+
+    st.caption("잘못 남긴 문장은 삭제할 수 있습니다. 문장을 삭제하면 가족 책장의 책장 관리 상태도 다시 계산됩니다.")
     for row in quotes_df.sort_values("created_at", ascending=False).itertuples():
         with st.container(border=True):
-            st.markdown(f"> {row.quote_text}")
-            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · 책: 《{get_book_title(row.book_id, books_df)}》 · p.{safe_int(row.page_number, 0)} · 작성일 {row.created_at}")
-            comment = str(row.comment or "").strip()
-            if comment:
-                st.write(comment)
+            content_col, action_col = st.columns([5, 1.4])
+            with content_col:
+                st.markdown(f"> {row.quote_text}")
+                st.caption(
+                    f"작성자: {get_member_name(row.member_id, members_df)} · "
+                    f"책: 《{get_book_title(row.book_id, books_df)}》 · "
+                    f"p.{safe_int(row.page_number, 0)} · 작성일 {row.created_at}"
+                )
+                comment = str(row.comment or "").strip()
+                if comment:
+                    st.write(comment)
+            with action_col:
+                pending_delete_id = st.session_state.get("pending_delete_quote_id")
+                if pending_delete_id == str(row.quote_id):
+                    st.warning("정말 이 문장을 삭제할까요?")
+                    if st.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}"):
+                        original_quotes = read_csv("quotes")
+                        updated_quotes = original_quotes[original_quotes["quote_id"].astype(str) != str(row.quote_id)].copy()
+                        write_csv("quotes", updated_quotes)
+                        st.session_state.pop("pending_delete_quote_id", None)
+                        st.session_state["quote_delete_feedback"] = "좋았던 문장을 삭제했습니다. 가족 책장 관리 상태가 다시 계산됩니다."
+                        st.rerun()
+                    if st.button("취소", key=f"cancel_delete_quote_{row.quote_id}"):
+                        st.session_state.pop("pending_delete_quote_id", None)
+                        st.rerun()
+                else:
+                    if st.button("문장 삭제", key=f"delete_quote_{row.quote_id}"):
+                        st.session_state["pending_delete_quote_id"] = str(row.quote_id)
+                        st.rerun()
 
 
 def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
+    delete_feedback = st.session_state.pop("review_delete_feedback", None)
+    if delete_feedback:
+        st.success(delete_feedback)
+
     reviews_df = read_csv("reviews")
     if marathon_id:
         reviews_df = filter_by_marathon(reviews_df, marathon_id)
     if reviews_df.empty:
         st.write("아직 저장된 감상이 없습니다.")
         return
+
+    st.caption("잘못 남긴 완독 감상은 삭제할 수 있습니다. 감상을 삭제하면 가족 책장의 완독 상태와 책장 관리 상태도 다시 계산됩니다.")
     for row in reviews_df.sort_values("created_at", ascending=False).itertuples():
         with st.container(border=True):
-            st.markdown(f"#### {'⭐' * safe_int(row.rating, 0)} 《{get_book_title(row.book_id, books_df)}》")
-            st.write(row.one_line_review)
-            full_review = str(row.full_review or "").strip()
-            if full_review:
-                st.caption(full_review)
-            finished_date = str(row.finished_date or "").strip()
-            finished_text = f"완독일 {finished_date}" if finished_date else "완독일 미입력"
-            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · {finished_text} · 작성일 {row.created_at}")
+            content_col, action_col = st.columns([5, 1.4])
+            with content_col:
+                st.markdown(f"#### {'⭐' * safe_int(row.rating, 0)} 《{get_book_title(row.book_id, books_df)}》")
+                st.write(row.one_line_review)
+                full_review = str(row.full_review or "").strip()
+                if full_review:
+                    st.caption(full_review)
+                finished_date = str(row.finished_date or "").strip()
+                finished_text = f"완독일 {finished_date}" if finished_date else "완독일 미입력"
+                st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · {finished_text} · 작성일 {row.created_at}")
+            with action_col:
+                pending_delete_id = st.session_state.get("pending_delete_review_id")
+                if pending_delete_id == str(row.review_id):
+                    st.warning("정말 이 감상을 삭제할까요?")
+                    if st.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}"):
+                        original_reviews = read_csv("reviews")
+                        updated_reviews = original_reviews[original_reviews["review_id"].astype(str) != str(row.review_id)].copy()
+                        write_csv("reviews", updated_reviews)
+                        st.session_state.pop("pending_delete_review_id", None)
+                        st.session_state["review_delete_feedback"] = "완독 감상을 삭제했습니다. 가족 책장 상태와 리포트가 다시 계산됩니다."
+                        st.rerun()
+                    if st.button("취소", key=f"cancel_delete_review_{row.review_id}"):
+                        st.session_state.pop("pending_delete_review_id", None)
+                        st.rerun()
+                else:
+                    if st.button("감상 삭제", key=f"delete_review_{row.review_id}"):
+                        st.session_state["pending_delete_review_id"] = str(row.review_id)
+                        st.rerun()
 
 
 def page_records(data: dict) -> None:
@@ -2073,6 +2288,14 @@ def page_settings(data: dict) -> None:
     st.caption("가족 구성원을 러너로 등록해 독서마라톤에 함께 참여할 수 있습니다.")
     settings_df = read_csv("settings")
     settings = get_active_marathon(settings_df)
+
+    with st.expander("🛠️ 개발/시연용 도구", expanded=False):
+        st.caption("발표 시연이나 초기 테스트가 필요할 때만 사용하세요. 기존 CSV 데이터가 샘플 데이터로 초기화됩니다.")
+        st.warning("샘플 데이터 생성 / 전체 초기화는 기존 기록을 덮어쓰는 개발·시연용 기능입니다. 실제 사용 중 새 달을 시작할 때는 아래의 '새 독서마라톤 시작' 기능을 사용해주세요.")
+        if st.button("🎁 샘플 데이터 생성 / 전체 초기화", type="primary", key="settings_create_sample_data"):
+            create_sample_data()
+            st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
+            st.rerun()
 
     st.subheader("🏁 현재 진행 중인 독서마라톤")
     st.info(f"{settings['marathon_name']} · {settings['start_date']} ~ {settings['end_date']}")
