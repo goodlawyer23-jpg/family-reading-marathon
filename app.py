@@ -32,6 +32,8 @@ def scroll_to_anchor(anchor_id: str) -> None:
     )
 
 APP_TITLE = "우리가족 독서마라톤"
+# 국립중앙도서관 API는 일부 PC/네트워크 환경에서 연결 지연을 일으킬 수 있어 기본 자동 조회를 끕니다.
+NLK_AUTO_LOOKUP_ENABLED = False
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 SAMPLE_DIR = BASE_DIR / "sample_data"
@@ -188,6 +190,89 @@ def member_options(members_df: pd.DataFrame) -> dict:
 
 def book_options(books_df: pd.DataFrame) -> dict:
     return {f"{row.title} - {row.author}": row.book_id for row in books_df.itertuples()}
+
+
+def is_book_finished_for_member(reviews_df: pd.DataFrame, member_id: str, book_id: str) -> bool:
+    """구성원+책 조합의 완독 감상 여부를 확인합니다."""
+    if reviews_df.empty:
+        return False
+    required = {"member_id", "book_id", "finished_date"}
+    if not required.issubset(set(reviews_df.columns)):
+        return False
+    matched = reviews_df[
+        (reviews_df["member_id"].astype(str).str.strip() == str(member_id).strip())
+        & (reviews_df["book_id"].astype(str).str.strip() == str(book_id).strip())
+        & (reviews_df["finished_date"].astype(str).str.strip().str.len() > 0)
+    ]
+    return not matched.empty
+
+
+def book_options_for_member(
+    books_df: pd.DataFrame,
+    member_id: str,
+    reviews_df: pd.DataFrame | None = None,
+    include_finished: bool = True,
+) -> dict:
+    """선택한 구성원의 책장에 등록된 책만 독서 기록 입력 후보로 반환합니다."""
+    if books_df.empty or "reader_member_id" not in books_df.columns:
+        return {}
+
+    member_books = books_df[books_df["reader_member_id"].astype(str).str.strip() == str(member_id).strip()].copy()
+    if member_books.empty:
+        return {}
+
+    if not include_finished and reviews_df is not None:
+        member_books = member_books[
+            ~member_books["book_id"].astype(str).apply(lambda bid: is_book_finished_for_member(reviews_df, member_id, bid))
+        ].copy()
+        if member_books.empty:
+            return {}
+
+    options = {}
+    duplicated_titles = member_books["title"].astype(str).duplicated(keep=False)
+    for idx, row in member_books.reset_index(drop=True).iterrows():
+        title = str(row.get("title", "제목 없음") or "제목 없음").strip()
+        author = str(row.get("author", "") or "").strip()
+        publisher = str(row.get("publisher", "") or "").strip()
+        base_label = f"{title} ({author})" if author else title
+        if bool(duplicated_titles.iloc[idx]):
+            detail = publisher or str(row.get("isbn", "") or "").strip() or str(row.get("book_id", ""))[-6:]
+            base_label = f"{base_label} - {detail}" if detail else base_label
+        if reviews_df is not None and is_book_finished_for_member(reviews_df, member_id, row.get("book_id", "")):
+            base_label = f"{base_label} · 완독"
+        label = base_label
+        suffix = 2
+        while label in options:
+            label = f"{base_label} #{suffix}"
+            suffix += 1
+        options[label] = row.get("book_id", "")
+    return options
+
+
+def clear_today_form_state(member_id: str, book_id: str) -> None:
+    """저장 완료 후 같은 입력값이 다시 제출되지 않도록 오늘 기록 입력 위젯 상태를 정리합니다."""
+    exact_keys = [
+        f"today_book_select_{member_id}",
+        f"today_date_{member_id}_{book_id}",
+        f"today_record_method_{member_id}_{book_id}",
+        f"today_start_{member_id}_{book_id}",
+        f"today_end_{member_id}_{book_id}",
+        f"today_pages_direct_{member_id}_{book_id}",
+        f"today_start_direct_{member_id}_{book_id}",
+        f"today_end_direct_{member_id}_{book_id}",
+        f"today_memo_{member_id}_{book_id}",
+        f"today_add_quote_{member_id}_{book_id}",
+        f"today_quote_page_{member_id}_{book_id}",
+        f"today_quote_text_{member_id}_{book_id}",
+        f"today_quote_comment_{member_id}_{book_id}",
+        f"today_finished_{member_id}_{book_id}",
+        f"today_rating_stars_{member_id}_{book_id}",
+        f"today_one_line_{member_id}_{book_id}",
+        f"today_full_review_{member_id}_{book_id}",
+        f"today_finished_date_{member_id}_{book_id}",
+    ]
+    for key in exact_keys:
+        st.session_state.pop(key, None)
 
 
 def create_sample_data() -> None:
@@ -408,31 +493,230 @@ def get_naver_credentials() -> tuple[str, str]:
     return str(client_id).strip(), str(client_secret).strip()
 
 
-def fetch_book_pages_by_isbn(isbn: str) -> int:
-    # 2차 개발에서 국립중앙도서관 ISBN API 등을 연결할 자리입니다.
-    return 0
+def get_nlk_cert_key() -> str:
+    """국립중앙도서관 ISBN 서지정보 API 인증키를 가져옵니다."""
+    cert_key = os.getenv("NLK_CERT_KEY", "")
+    try:
+        cert_key = cert_key or st.secrets.get("NLK_CERT_KEY", "")
+    except Exception:
+        pass
+    return str(cert_key).strip()
 
 
-def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bool, str]:
+def extract_pages_from_text(text: str) -> int | None:
+    """형태사항 문자열 등에서 페이지 수를 추출합니다."""
+    value = str(text or "").strip()
+    if not value:
+        return None
+
+    patterns = [
+        r"(\d{1,4})\s*(?:쪽|페이지|page|pages|p\.|p\b|면)",
+        r"^(\d{1,4})\s*(?:[,;:/]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match:
+            pages = safe_int(match.group(1), 0)
+            if 1 <= pages <= 3000:
+                return pages
+    return None
+
+
+def extract_pages_from_nlk_payload(payload) -> int | None:
+    """국립중앙도서관 ISBN API 응답에서 페이지 수 후보를 폭넓게 탐색합니다."""
+    preferred_key_terms = ["page", "pages", "쪽", "페이지", "형태", "form", "extent", "physical", "description"]
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            # 페이지 수가 들어갈 가능성이 높은 필드를 먼저 확인합니다.
+            for key, value in obj.items():
+                key_text = str(key).lower()
+                if any(term in key_text for term in preferred_key_terms):
+                    pages = extract_pages_from_text(value)
+                    if pages:
+                        return pages
+            for value in obj.values():
+                pages = walk(value)
+                if pages:
+                    return pages
+        elif isinstance(obj, list):
+            for item in obj:
+                pages = walk(item)
+                if pages:
+                    return pages
+        return None
+
+    return walk(payload)
+
+
+def fetch_book_pages_by_isbn_nlk(isbn: str) -> dict:
+    """ISBN으로 국립중앙도서관 ISBN 서지정보 API에서 전체 페이지 수를 조회합니다.
+
+    반환값은 앱 화면과 test_nlk_api.py에서 함께 쓰기 쉽도록 상태 정보를 담은 dict입니다.
+    """
+    cert_key = get_nlk_cert_key()
+    clean_isbn = normalize_isbn_for_search(isbn)
+    result = {
+        "source": "국립중앙도서관",
+        "status": "not_called",
+        "pages": None,
+        "message": "",
+        "debug": {},
+    }
+
+    if not clean_isbn:
+        result.update({"status": "no_isbn", "message": "ISBN이 없어 국립중앙도서관 API를 조회하지 않았습니다."})
+        return result
+    if not cert_key:
+        result.update({"status": "no_key", "message": "국립중앙도서관 API 키가 없어 페이지 수 자동 조회를 건너뛰었습니다."})
+        return result
+
+    url = "https://www.nl.go.kr/seoji/SearchApi.do"
+    params = {
+        "cert_key": cert_key,
+        "result_style": "json",
+        "page_no": 1,
+        "page_size": 1,
+        "isbn": clean_isbn,
+    }
+    safe_params = dict(params)
+    safe_params["cert_key"] = "***"
+    result["debug"] = {"url": url, "params": safe_params}
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        result["debug"]["status_code"] = response.status_code
+        result["debug"]["response_preview"] = response.text.replace(cert_key, "***")[:800]
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError:
+            result.update({
+                "status": "parse_error",
+                "message": "국립중앙도서관 API 응답을 JSON으로 해석하지 못했습니다.",
+            })
+            return result
+
+        pages = extract_pages_from_nlk_payload(payload)
+        result["debug"]["payload_preview"] = str(payload).replace(cert_key, "***")[:1200]
+        if pages:
+            result.update({
+                "status": "success",
+                "pages": int(pages),
+                "message": f"국립중앙도서관 API 조회 성공 / 페이지 수 {int(pages)}쪽 반영",
+            })
+        else:
+            result.update({
+                "status": "no_pages",
+                "message": "국립중앙도서관 API 조회는 성공했지만 페이지 수를 추출하지 못했습니다.",
+            })
+        return result
+    except requests.Timeout:
+        result.update({
+            "status": "timeout",
+            "message": "국립중앙도서관 API 연결 시간 초과",
+        })
+        result["debug"]["error"] = "timeout"
+        return result
+    except requests.RequestException as e:
+        result.update({
+            "status": "request_failed",
+            "message": "국립중앙도서관 API 호출 실패",
+        })
+        result["debug"]["error"] = e.__class__.__name__
+        return result
+    except Exception as e:
+        result.update({
+            "status": "request_failed",
+            "message": "국립중앙도서관 API 처리 중 오류",
+        })
+        result["debug"]["error"] = e.__class__.__name__
+        return result
+
+
+def fetch_book_pages_by_isbn_aladin(isbn: str) -> dict:
+    """향후 알라딘 Open API로 페이지 수를 보강할 때 사용할 자리입니다."""
+    return {
+        "source": "알라딘",
+        "status": "not_implemented",
+        "pages": None,
+        "message": "알라딘 페이지 수 조회는 아직 연결하지 않았습니다.",
+        "debug": {},
+    }
+
+
+def fetch_book_pages_by_isbn(isbn: str) -> dict:
+    """ISBN 기반 페이지 수 보강 통합 함수입니다."""
+    nlk_result = fetch_book_pages_by_isbn_nlk(isbn)
+    if nlk_result.get("pages"):
+        return nlk_result
+
+    # 향후 알라딘 API를 실제 연결하면 여기에서 fallback으로 호출할 수 있습니다.
+    aladin_result = fetch_book_pages_by_isbn_aladin(isbn)
+    nlk_result["fallback"] = aladin_result
+    return nlk_result
+
+
+def build_page_lookup_message(total_pages: int, lookup_result: dict | None) -> tuple[str, str]:
+    """사용자용 메시지와 개발 확인용 메시지를 나눠 반환합니다."""
+    lookup_result = lookup_result or {}
+    status = lookup_result.get("status", "not_called")
+    detail = lookup_result.get("message", "")
+
+    if total_pages > 0 and status == "success":
+        return f"전체 페이지 수 {total_pages}쪽을 자동으로 반영했습니다.", detail
+    if total_pages > 0:
+        return f"전체 페이지 수 {total_pages}쪽을 반영했습니다.", detail or "네이버/샘플/직접 입력값의 페이지 수를 저장했습니다."
+    if status == "auto_off":
+        return "전체 페이지 수는 나중에 입력할 수 있습니다.", detail
+    if status == "no_key":
+        return "전체 페이지 수는 나중에 입력할 수 있습니다.", "국립중앙도서관 API 키 없음"
+    if status == "no_pages":
+        return "전체 페이지 수는 나중에 입력할 수 있습니다.", detail
+    if status in {"request_failed", "parse_error", "timeout"}:
+        return "전체 페이지 수는 나중에 입력할 수 있습니다.", detail
+    if status == "no_isbn":
+        return "ISBN이 없어 전체 페이지 수는 나중에 입력할 수 있습니다.", detail
+    return "전체 페이지 수는 나중에 입력할 수 있습니다.", detail
+
+
+def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bool, str, str]:
     """책장에 책을 추가합니다. 같은 책+같은 구성원 조합은 중복 등록하지 않습니다."""
     books_df = read_csv("books")
     title = clean_html(book_data.get("title", "")).strip()
     reader_member_id = str(reader_member_id or "").strip()
+    isbn = str(book_data.get("isbn", "") or "").strip()
+    total_pages = safe_int(book_data.get("total_pages"), 0)
+    lookup_result = {"status": "not_called", "message": ""}
+
+    # 안정적인 책 등록 UX를 위해 국립중앙도서관 API는 책장 추가 시 자동 호출하지 않습니다.
+    # 네이버/샘플/직접등록 값에 total_pages가 있으면 그대로 저장하고, 없으면 0으로 저장합니다.
+    if total_pages <= 0:
+        lookup_result = {
+            "status": "auto_off",
+            "message": "국립중앙도서관 페이지 수 자동 조회는 기본값 OFF입니다. 필요하면 설정 화면의 수동 테스트를 사용하세요.",
+        }
+
+    page_message, detail_message = build_page_lookup_message(total_pages, lookup_result)
 
     duplicate_book_mask = same_book_mask(books_df, book_data)
     if len(duplicate_book_mask) == len(books_df) and duplicate_book_mask.any():
         same_reader_mask = books_df.get("reader_member_id", pd.Series([""] * len(books_df))).astype(str).str.strip() == reader_member_id
         same_book_same_reader = books_df[duplicate_book_mask & same_reader_mask]
         if not same_book_same_reader.empty:
-            return False, f"이미 이 구성원의 책장에 《{title or '이 책'}》이 있습니다."
+            return False, f"이미 이 구성원의 책장에 《{title or '이 책'}》이 있습니다.", "중복 책장 추가 방지"
 
         no_reader_mask = books_df.get("reader_member_id", pd.Series([""] * len(books_df))).astype(str).str.strip() == ""
         no_reader_rows = books_df[duplicate_book_mask & no_reader_mask]
         if reader_member_id and not no_reader_rows.empty:
             idx = no_reader_rows.index[0]
             books_df.loc[idx, "reader_member_id"] = reader_member_id
+            if safe_int(books_df.loc[idx, "total_pages"], 0) <= 0 and total_pages > 0:
+                books_df.loc[idx, "total_pages"] = total_pages
             write_csv("books", books_df)
-            return True, f"기존 책장 항목에 읽는 사람을 연결했습니다."
+            # 저장 직후 다음 렌더링에서 반드시 최신 CSV를 읽도록 표시합니다.
+            st.session_state["books_csv_updated_at"] = now_str()
+            return True, f"기존 책장 항목에 읽는 사람을 연결했습니다. {page_message}", detail_message
 
     row = {col: book_data.get(col, "") for col in CSV_COLUMNS["books"]}
     row["book_id"] = make_id("book")
@@ -443,12 +727,14 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
     row["description"] = clean_html(row.get("description", ""))
     row["pubdate"] = normalize_pubdate(row.get("pubdate", ""))
     row["image_url"] = row.get("image_url") or PLACEHOLDER_COVER
-    row["total_pages"] = safe_int(row.get("total_pages"), 0)
+    row["total_pages"] = total_pages
     row["source_api"] = row.get("source_api") or "manual"
     row["created_at"] = now_str()
     books_df = pd.concat([books_df, pd.DataFrame([row])], ignore_index=True)
     write_csv("books", books_df)
-    return True, "가족 책장에 추가했습니다."
+    # 저장 직후 다음 렌더링에서 반드시 최신 CSV를 읽도록 표시합니다.
+    st.session_state["books_csv_updated_at"] = now_str()
+    return True, page_message, detail_message
 
 
 def calculate_summary(data: dict) -> dict:
@@ -493,11 +779,39 @@ def get_member_stats(logs_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.Data
     return stats.sort_values("weighted_pages", ascending=False)
 
 
+def get_last_end_page(logs_df: pd.DataFrame, member_id: str, book_id: str) -> int:
+    """선택한 구성원+책 조합의 마지막 끝 페이지를 반환합니다."""
+    if logs_df.empty:
+        return 0
+    target_logs = logs_df[
+        (logs_df["member_id"].astype(str) == str(member_id))
+        & (logs_df["book_id"].astype(str) == str(book_id))
+    ].copy()
+    if target_logs.empty or "end_page" not in target_logs.columns:
+        return 0
+    target_logs["end_page_num"] = target_logs["end_page"].apply(safe_int)
+    return safe_int(target_logs["end_page_num"].max(), 0)
+
+
 def get_book_progress(book_id: str, books_df: pd.DataFrame, logs_df: pd.DataFrame) -> tuple[int, int, float]:
+    """책장 카드용 진행률을 계산합니다.
+
+    누적 페이지 표시는 pages_read 합계를 유지하되, 진행률은 가능하면
+    해당 책의 가장 큰 end_page 기준으로 계산합니다. 직접 입력처럼 end_page가
+    없는 기록만 있는 경우에는 pages_read 합계 기준으로 fallback합니다.
+    """
     book = books_df[books_df["book_id"] == book_id]
     total_pages = safe_int(book.iloc[0]["total_pages"], 0) if not book.empty else 0
-    pages_sum = safe_int(logs_df[logs_df["book_id"] == book_id]["pages_read"].sum(), 0) if not logs_df.empty else 0
-    progress = min(pages_sum / total_pages * 100, 100) if total_pages > 0 else 0
+    book_logs = logs_df[logs_df["book_id"] == book_id].copy() if not logs_df.empty else pd.DataFrame()
+    pages_sum = safe_int(book_logs["pages_read"].sum(), 0) if not book_logs.empty else 0
+    if not book_logs.empty and "end_page" in book_logs.columns:
+        book_logs["end_page_num"] = book_logs["end_page"].apply(safe_int)
+        progress_pages = safe_int(book_logs["end_page_num"].max(), 0)
+    else:
+        progress_pages = 0
+    if progress_pages <= 0:
+        progress_pages = pages_sum
+    progress = min(progress_pages / total_pages * 100, 100) if total_pages > 0 else 0
     return pages_sum, total_pages, progress
 
 
@@ -570,14 +884,28 @@ def page_book_search(data: dict) -> None:
     st.info("네이버 책 검색 API: 사용 가능" if api_ready else "네이버 API 키가 없어 샘플 책 검색으로 작동합니다.")
     feedback = st.session_state.pop("book_add_feedback", None)
     if feedback:
-        level, text = feedback
+        level = feedback[0]
+        text = feedback[1] if len(feedback) > 1 else ""
+        detail = feedback[2] if len(feedback) > 2 else ""
         if level == "success":
             st.success(text)
         else:
             st.warning(text)
+        if detail:
+            with st.expander("페이지 수 조회 상태", expanded=False):
+                st.caption(detail)
 
-    tab1, tab2 = st.tabs(["네이버/샘플 검색", "직접 등록"])
-    with tab1:
+    # Streamlit의 st.tabs는 모든 탭 내용을 동시에 렌더링하므로, 검색 결과와 직접등록 폼이 섞여 보이는 환경을 막기 위해
+    # 탭처럼 보이는 라디오 선택으로 현재 선택한 등록 방식만 렌더링합니다.
+    registration_view = st.radio(
+        "등록 방식",
+        ["네이버/샘플 검색", "직접 등록"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="book_registration_view",
+    )
+
+    if registration_view == "네이버/샘플 검색":
         st.markdown("#### 1단계. 검색 방식을 선택하세요")
         search_mode_label = st.radio("검색 방식", ["책 제목 검색", "ISBN 검색"], horizontal=True)
         display_count = 50
@@ -586,42 +914,51 @@ def page_book_search(data: dict) -> None:
         search_mode = "isbn" if search_mode_label == "ISBN 검색" else "title"
         placeholder = "예: 978-8954677158" if search_mode == "isbn" else "예: 긴긴밤, 해리 포터"
         label = "ISBN 입력" if search_mode == "isbn" else "책 제목 또는 저자 검색"
-        query = st.text_input(label, placeholder=placeholder)
+        with st.form(key=f"book_search_form_{search_mode}", clear_on_submit=False):
+            query = st.text_input(label, placeholder=placeholder)
+            search_submitted = st.form_submit_button("검색하기", type="primary")
 
         st.markdown("#### 2단계. 이 책을 읽을 가족 구성원을 선택하세요")
         st.caption("검색 결과에서 책장에 추가하면, 아래에서 선택한 가족 구성원의 책장에 바로 연결됩니다.")
         selected_reader_label = st.selectbox("읽을 가족 구성원", list(m_options.keys()), key="search_reader")
         selected_reader_id = m_options[selected_reader_label]
 
-        if st.button("검색하기", type="primary"):
-            naver_results = []
-            search_source = "sample"
-            normalized_query = normalize_isbn_for_search(query) if search_mode == "isbn" else query
-
-            if api_ready:
-                naver_results = search_books_naver(
-                    normalized_query,
-                    client_id,
-                    client_secret,
-                    display=int(display_count),
-                    search_mode=search_mode,
-                )
-                if naver_results:
-                    search_source = "naver"
-
-            if naver_results:
-                results = naver_results
-                message = f"네이버 책 검색 결과 {len(results)}건을 찾았습니다."
+        if search_submitted:
+            normalized_query = normalize_isbn_for_search(query) if search_mode == "isbn" else str(query or "").strip()
+            if not str(normalized_query).strip():
+                st.warning("검색어를 입력한 뒤 Enter를 누르거나 검색하기 버튼을 눌러주세요.")
+                st.session_state["book_search_results"] = []
+                st.session_state["book_search_message"] = "검색어가 비어 있어 검색하지 않았습니다."
+                st.session_state["book_search_page"] = 1
             else:
-                results = search_books_sample(normalized_query, display=int(display_count), search_mode=search_mode)
-                message = "네이버 검색 결과가 없거나 API 호출에 실패해 샘플 검색 결과를 표시합니다." if api_ready else "샘플 검색 결과를 표시합니다."
+                naver_results = []
+                search_source = "sample"
 
-            st.session_state["book_search_results"] = results
-            st.session_state["book_search_source"] = search_source
-            st.session_state["book_search_message"] = message
-            st.session_state["book_search_mode"] = search_mode
-            st.session_state["book_search_display"] = int(display_count)
-            st.session_state["book_search_page"] = 1
+                if api_ready:
+                    naver_results = search_books_naver(
+                        normalized_query,
+                        client_id,
+                        client_secret,
+                        display=int(display_count),
+                        search_mode=search_mode,
+                    )
+                    if naver_results:
+                        search_source = "naver"
+
+                if naver_results:
+                    results = naver_results
+                    message = f"네이버 책 검색 결과 {len(results)}건을 찾았습니다."
+                else:
+                    results = search_books_sample(normalized_query, display=int(display_count), search_mode=search_mode)
+                    message = "네이버 검색 결과가 없거나 API 호출에 실패해 샘플 검색 결과를 표시합니다." if api_ready else "샘플 검색 결과를 표시합니다."
+
+                st.session_state["book_search_results"] = results
+                st.session_state["book_search_source"] = search_source
+                st.session_state["book_search_message"] = message
+                st.session_state["book_search_mode"] = search_mode
+                st.session_state["book_search_display"] = int(display_count)
+                st.session_state["book_search_page"] = 1
+                st.session_state["scroll_to_book_results"] = True
 
         results = st.session_state.get("book_search_results", [])
         if st.session_state.get("book_search_message"):
@@ -667,9 +1004,20 @@ def page_book_search(data: dict) -> None:
                         st.markdown(f"### {title}")
                         st.write(f"저자: {author or '-'} · 출판사: {publisher or '-'}")
                         st.write(f"ISBN: {book.get('isbn', '-') or '-'} · 출간일: {pubdate or '-'}")
-                        st.write(f"전체 페이지: {safe_int(book.get('total_pages'), 0) or '미입력'}")
+                        original_total_pages = safe_int(book.get('total_pages'), 0)
+                        total_pages_input = st.number_input(
+                            "전체 페이지 수",
+                            min_value=0,
+                            step=1,
+                            value=max(0, original_total_pages),
+                            key=f"search_total_pages_{global_idx}_{selected_reader_id}",
+                            help="페이지 수를 알고 있으면 책장에 추가하기 전에 입력해주세요. 0이면 나중에 가족 책장에서 수정할 수 있습니다.",
+                        )
                         if description:
-                            st.caption(description)
+                            with st.expander("책 소개 보기", expanded=False):
+                                st.write(description)
+                        else:
+                            st.caption("책 소개 없음")
                         if st.button(f"{selected_reader_label}의 책장에 추가", key=f"add_search_{global_idx}_{selected_reader_id}"):
                             book_to_add = dict(book)
                             book_to_add.update({
@@ -678,12 +1026,13 @@ def page_book_search(data: dict) -> None:
                                 "publisher": publisher,
                                 "description": description,
                                 "pubdate": pubdate,
+                                "total_pages": safe_int(total_pages_input, 0),
                             })
-                            success, msg = add_book_to_library(book_to_add, selected_reader_id)
+                            success, msg, detail = add_book_to_library(book_to_add, selected_reader_id)
                             if success:
-                                st.session_state["book_add_feedback"] = ("success", f"《{title}》을 {selected_reader_label}의 책장에 추가했습니다.")
+                                st.session_state["book_add_feedback"] = ("success", f"《{title}》을 {selected_reader_label}의 책장에 추가했습니다. {msg}", detail)
                             else:
-                                st.session_state["book_add_feedback"] = ("warning", msg)
+                                st.session_state["book_add_feedback"] = ("warning", msg, detail)
                             st.rerun()
 
             if search_page_count > 1:
@@ -698,7 +1047,8 @@ def page_book_search(data: dict) -> None:
                             st.session_state["scroll_to_book_results"] = True
                             st.rerun()
 
-    with tab2:
+    else:
+        st.markdown("#### 직접 등록")
         st.caption("직접 등록할 때도 읽을 가족 구성원을 함께 선택합니다. 저장 즉시 가족 책장에 읽는 사람이 표시됩니다.")
         with st.form("manual_book_form"):
             reader_label = st.selectbox("이 책을 읽을 사람", list(m_options.keys()), key="manual_reader")
@@ -715,25 +1065,28 @@ def page_book_search(data: dict) -> None:
             if not title.strip():
                 st.error("제목은 필수입니다.")
             else:
-                success, msg = add_book_to_library({
+                success, msg, detail = add_book_to_library({
                     "book_id": make_id("book"), "title": title, "author": author, "publisher": publisher,
                     "isbn": isbn, "image_url": image_url, "description": description, "pubdate": pubdate,
                     "total_pages": total_pages, "source_api": "manual", "created_at": now_str(),
                 }, m_options[reader_label])
                 if success:
-                    st.session_state["book_add_feedback"] = ("success", f"《{clean_html(title)}》을 {reader_label}의 책장에 추가했습니다.")
+                    st.session_state["book_add_feedback"] = ("success", f"《{clean_html(title)}》을 {reader_label}의 책장에 추가했습니다. {msg}", detail)
                     st.rerun()
                 else:
                     st.warning(msg)
-
+                    if detail:
+                        st.caption(f"개발 확인: {detail}")
 
 def page_library(data: dict) -> None:
     st.title("📚 가족 책장")
     st.caption("책을 추가할 때 선택한 읽는 사람이 바로 표시됩니다. 독서 기록을 아직 입력하지 않아도 가족별 책장을 확인할 수 있습니다.")
-    books_df = data["books"]
-    logs_df = enrich_logs(data["reading_logs"], data["family_members"], books_df)
-    reviews_df = data["reviews"]
-    members_df = data["family_members"]
+    # 책장 화면은 저장 직후 갱신 UX가 중요하므로, 전달받은 data 대신 CSV를 한 번 더 읽어 최신 상태를 보장합니다.
+    books_df = read_csv("books")
+    members_df = read_csv("family_members")
+    reading_logs_df = read_csv("reading_logs")
+    reviews_df = read_csv("reviews")
+    logs_df = enrich_logs(reading_logs_df, members_df, books_df)
 
     if books_df.empty:
         st.warning("책장이 비어 있습니다. 샘플 데이터를 생성하거나 책을 등록해주세요.")
@@ -762,7 +1115,7 @@ def page_library(data: dict) -> None:
                         registered_reader = get_member_name(reader_id, members_df) if reader_id else ""
                         log_readers = logs_df[logs_df["book_id"] == book["book_id"]]["member_name"].dropna().unique().tolist() if not logs_df.empty else []
                         readers = [registered_reader] if registered_reader else log_readers
-                        finished = not reviews_df[(reviews_df["book_id"] == book["book_id"]) & (reviews_df["finished_date"].astype(str).str.len() > 0)].empty if not reviews_df.empty else False
+                        finished = not reviews_df[(reviews_df["book_id"].astype(str) == str(book["book_id"])) & (reviews_df["member_id"].astype(str) == str(reader_id)) & (reviews_df["finished_date"].astype(str).str.len() > 0)].empty if (not reviews_df.empty and reader_id) else False
 
                         st.markdown(f"**읽는 사람**  \n{', '.join(readers) if readers else '아직 없음'}")
                         st.markdown(f"**상태**  \n{'✅ 완독' if finished else '📖 읽는 중'}")
@@ -775,177 +1128,367 @@ def page_library(data: dict) -> None:
                     else:
                         st.progress(0, text=f"{pages_sum}쪽 기록 · 전체 페이지 미입력")
 
+                    with st.expander("전체 페이지 수 수정", expanded=False):
+                        edited_total_pages = st.number_input(
+                            "새 전체 페이지 수",
+                            min_value=0,
+                            step=1,
+                            value=max(0, safe_int(total_pages, 0)),
+                            key=f"library_total_pages_{book['book_id']}",
+                        )
+                        if st.button("전체 페이지 수 저장", key=f"save_total_pages_{book['book_id']}"):
+                            latest_books_df = read_csv("books")
+                            mask = latest_books_df["book_id"].astype(str) == str(book["book_id"])
+                            if mask.any():
+                                latest_books_df.loc[mask, "total_pages"] = safe_int(edited_total_pages, 0)
+                                write_csv("books", latest_books_df)
+                                st.success("전체 페이지 수를 저장했습니다. 진행률을 다시 계산합니다.")
+                                st.rerun()
+                            else:
+                                st.warning("수정할 책을 찾지 못했습니다.")
 
-def page_reading_log(data: dict) -> None:
-    st.title("✍️ 독서 기록 입력")
-    members_df = data["family_members"]
-    books_df = data["books"]
-    if members_df.empty or books_df.empty:
-        st.warning("가족 구성원과 책이 필요합니다. 먼저 샘플 데이터를 생성하거나 책을 등록해주세요.")
+
+def page_today_reading(data: dict) -> None:
+    st.title("✍️ 오늘의 독서 기록")
+    st.caption("읽은 페이지는 필수로 기록하고, 좋았던 문장은 선택으로 남깁니다. 별점과 감상은 책을 완독했을 때 기록합니다.")
+
+    feedback = st.session_state.pop("today_save_feedback", None)
+    if feedback:
+        for idx, message in enumerate(feedback):
+            if idx == 0:
+                st.success(message)
+            else:
+                st.info(message)
+
+    members_df = read_csv("family_members")
+    books_df = read_csv("books")
+    logs_df = read_csv("reading_logs")
+    quotes_df = read_csv("quotes")
+    reviews_df = read_csv("reviews")
+
+    if members_df.empty:
+        st.warning("가족 구성원이 필요합니다. 먼저 샘플 데이터를 생성하거나 가족 구성원을 추가해주세요.")
         return
+    if books_df.empty:
+        st.warning("등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
+        return
+
+    st.markdown("### 1단계. 누가 읽었나요?")
     m_options = member_options(members_df)
-    b_options = book_options(books_df)
-    with st.form("reading_log_form"):
-        member_label = st.selectbox("가족 구성원", list(m_options.keys()))
-        book_label = st.selectbox("책", list(b_options.keys()))
-        reading_date = st.date_input("날짜", value=date.today())
-        pages_read = st.number_input("읽은 페이지 수", min_value=1, step=1, value=10)
+    member_label = st.selectbox("가족 구성원", list(m_options.keys()), key="today_member_select")
+    member_id = m_options[member_label]
+
+    st.markdown("### 2단계. 어떤 책을 읽었나요?")
+    all_member_books_options = book_options_for_member(books_df, member_id, reviews_df=reviews_df, include_finished=True)
+    if not all_member_books_options:
+        st.info("이 구성원의 책장에 등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
+        return
+
+    show_finished_books = st.checkbox("완독한 책도 보기", value=False, key=f"today_show_finished_{member_id}")
+    member_books_options = book_options_for_member(
+        books_df,
+        member_id,
+        reviews_df=reviews_df,
+        include_finished=show_finished_books,
+    )
+    if not member_books_options:
+        st.info("기록할 수 있는 읽는 중인 책이 없습니다. 완독한 책도 보려면 ‘완독한 책도 보기’를 선택해주세요.")
+        return
+
+    placeholder_label = "책을 선택하세요"
+    book_labels = [placeholder_label] + list(member_books_options.keys())
+    book_label = st.selectbox("책", book_labels, key=f"today_book_select_{member_id}")
+    if book_label == placeholder_label:
+        st.info("기록할 책을 먼저 선택해주세요. 책을 선택하면 페이지 입력과 선택 기록 입력칸이 표시됩니다.")
+        return
+
+    book_id = member_books_options[book_label]
+    book_title = get_book_title(book_id, books_df)
+
+    last_end_page = get_last_end_page(logs_df, member_id, book_id)
+    suggested_start = last_end_page + 1 if last_end_page > 0 else 1
+    if last_end_page > 0:
+        st.info(f"지난번에 {last_end_page}쪽까지 읽었습니다. 오늘은 {suggested_start}쪽부터 시작할까요?")
+    else:
+        st.caption("이 책의 첫 기록입니다. 시작 페이지 기본값은 1쪽입니다.")
+
+    st.markdown("### 3단계. 오늘 어디서부터 어디까지 읽었나요?")
+    reading_date = st.date_input("날짜", value=date.today(), key=f"today_date_{member_id}_{book_id}")
+    record_method = st.radio(
+        "기록 방식",
+        ["시작/끝 페이지로 계산", "읽은 페이지 수 직접 입력"],
+        horizontal=True,
+        key=f"today_record_method_{member_id}_{book_id}",
+    )
+
+    start_page = 0
+    end_page = 0
+    pages_read = 0
+
+    if record_method == "시작/끝 페이지로 계산":
+        col1, col2, col3 = st.columns(3)
+        start_page = col1.number_input(
+            "시작 페이지",
+            min_value=1,
+            step=1,
+            value=max(1, suggested_start),
+            key=f"today_start_{member_id}_{book_id}",
+        )
+        default_end = max(int(start_page), int(start_page) + 9)
+        end_page = col2.number_input(
+            "끝 페이지",
+            min_value=1,
+            step=1,
+            value=default_end,
+            key=f"today_end_{member_id}_{book_id}",
+        )
+        if int(end_page) >= int(start_page):
+            pages_read = int(end_page) - int(start_page) + 1
+            col3.metric("자동 계산", f"{pages_read}쪽")
+        else:
+            col3.metric("자동 계산", "확인 필요")
+            st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
+    else:
+        pages_read = st.number_input(
+            "읽은 페이지 수",
+            min_value=1,
+            step=1,
+            value=10,
+            key=f"today_pages_direct_{member_id}_{book_id}",
+        )
         col1, col2 = st.columns(2)
-        start_page = col1.number_input("시작 페이지", min_value=0, step=1, value=0)
-        end_page = col2.number_input("끝 페이지", min_value=0, step=1, value=0)
-        memo = st.text_area("메모", placeholder="예: 자기 전에 20분 읽음")
-        submitted = st.form_submit_button("독서 기록 저장")
-    if submitted:
-        member_id = m_options[member_label]
-        book_id = b_options[book_label]
+        start_page = col1.number_input(
+            "시작 페이지 선택 입력",
+            min_value=0,
+            step=1,
+            value=0,
+            key=f"today_start_direct_{member_id}_{book_id}",
+        )
+        end_page = col2.number_input(
+            "끝 페이지 선택 입력",
+            min_value=0,
+            step=1,
+            value=0,
+            key=f"today_end_direct_{member_id}_{book_id}",
+        )
+        st.caption("페이지 번호가 없거나 건너뛰어 읽은 경우에는 읽은 페이지 수만 직접 입력해도 됩니다.")
+
+    memo = st.text_area("메모", placeholder="예: 자기 전에 20분 읽음", key=f"today_memo_{member_id}_{book_id}")
+
+    st.markdown("### 4단계. 좋았던 문장이 있나요?")
+    add_quote = st.checkbox("좋았던 문장도 남기기", key=f"today_add_quote_{member_id}_{book_id}")
+    quote_page = 0
+    quote_text = ""
+    quote_comment = ""
+    if add_quote:
+        quote_page = st.number_input("문장 페이지 번호", min_value=0, step=1, value=safe_int(end_page, 0), key=f"today_quote_page_{member_id}_{book_id}")
+        quote_text = st.text_area("좋았던 문장", key=f"today_quote_text_{member_id}_{book_id}")
+        quote_comment = st.text_area("내 생각", key=f"today_quote_comment_{member_id}_{book_id}")
+
+    st.markdown("### 5단계. 오늘 이 책을 완독했나요?")
+    finished = st.checkbox("오늘 이 책을 완독했나요?", key=f"today_finished_{member_id}_{book_id}")
+    rating = 5
+    one_line_review = ""
+    full_review = ""
+    finished_date_value = reading_date
+    rating_options = {
+        "⭐": 1,
+        "⭐⭐": 2,
+        "⭐⭐⭐": 3,
+        "⭐⭐⭐⭐": 4,
+        "⭐⭐⭐⭐⭐": 5,
+    }
+    if finished:
+        rating_label = st.radio(
+            "별점",
+            list(rating_options.keys()),
+            index=4,
+            horizontal=True,
+            key=f"today_rating_stars_{member_id}_{book_id}",
+        )
+        rating = rating_options[rating_label]
+        one_line_review = st.text_input("한 줄 감상", placeholder="이 책을 다 읽고 남기고 싶은 한 문장", key=f"today_one_line_{member_id}_{book_id}")
+        full_review = st.text_area("자세한 감상", placeholder="선택 입력", key=f"today_full_review_{member_id}_{book_id}")
+        finished_date_value = st.date_input("완독일", value=reading_date, key=f"today_finished_date_{member_id}_{book_id}")
+    else:
+        st.caption("완독했을 때만 별점과 한 줄 감상을 저장합니다.")
+
+    st.markdown("### 6단계. 저장")
+    if st.button("오늘의 기록 저장", type="primary", use_container_width=True, key=f"save_today_{member_id}_{book_id}"):
+        if record_method == "시작/끝 페이지로 계산" and int(end_page) < int(start_page):
+            st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
+            return
+        if safe_int(pages_read, 0) <= 0:
+            st.error("읽은 페이지 수는 1쪽 이상이어야 합니다.")
+            return
+        if add_quote and not str(quote_text).strip():
+            st.error("좋았던 문장을 입력하거나, '좋았던 문장도 남기기' 체크를 해제해주세요.")
+            return
+        if finished and not str(one_line_review).strip():
+            st.error("완독 감상을 저장하려면 한 줄 감상을 입력하거나, '오늘 이 책을 완독했나요?' 체크를 해제해주세요.")
+            return
+
         member_row = members_df[members_df["member_id"] == member_id].iloc[0]
         weight = safe_float(member_row["weight"], 1.0)
-        row = {
-            "log_id": make_id("log"), "member_id": member_id, "book_id": book_id,
-            "reading_date": reading_date.isoformat(), "pages_read": pages_read,
-            "weighted_pages": round(pages_read * weight, 1), "start_page": start_page,
-            "end_page": end_page, "memo": memo, "created_at": now_str(),
+        log_row = {
+            "log_id": make_id("log"),
+            "member_id": member_id,
+            "book_id": book_id,
+            "reading_date": reading_date.isoformat(),
+            "pages_read": safe_int(pages_read, 0),
+            "weighted_pages": round(safe_int(pages_read, 0) * weight, 1),
+            "start_page": safe_int(start_page, 0),
+            "end_page": safe_int(end_page, 0),
+            "memo": memo,
+            "created_at": now_str(),
         }
-        logs_df = pd.concat([data["reading_logs"], pd.DataFrame([row])], ignore_index=True)
+        logs_df = pd.concat([logs_df, pd.DataFrame([log_row])], ignore_index=True)
         write_csv("reading_logs", logs_df)
-        st.success(f"저장했습니다. 가중치 반영 페이지는 {row['weighted_pages']}쪽입니다.")
+
+        saved_quote = False
+        if add_quote:
+            quote_row = {
+                "quote_id": make_id("quote"),
+                "member_id": member_id,
+                "book_id": book_id,
+                "page_number": safe_int(quote_page, 0),
+                "quote_text": str(quote_text).strip(),
+                "comment": quote_comment,
+                "created_at": now_str(),
+            }
+            quotes_df = pd.concat([quotes_df, pd.DataFrame([quote_row])], ignore_index=True)
+            write_csv("quotes", quotes_df)
+            saved_quote = True
+
+        saved_review = False
+        if finished:
+            review_row = {
+                "review_id": make_id("review"),
+                "member_id": member_id,
+                "book_id": book_id,
+                "rating": safe_int(rating, 5),
+                "one_line_review": str(one_line_review).strip(),
+                "full_review": full_review,
+                "finished_date": finished_date_value.isoformat(),
+                "created_at": now_str(),
+            }
+            reviews_df = pd.concat([reviews_df, pd.DataFrame([review_row])], ignore_index=True)
+            write_csv("reviews", reviews_df)
+            saved_review = True
+
+        messages = [
+            "오늘의 독서 기록을 저장했습니다.",
+            f"읽은 페이지 {safe_int(pages_read, 0)}쪽이 반영되었습니다.",
+        ]
+        if saved_quote:
+            messages.append("좋았던 문장도 함께 저장했습니다.")
+        if saved_review:
+            messages.append("완독 감상과 별점을 저장했습니다.")
+        st.session_state["today_save_feedback"] = messages
+        clear_today_form_state(member_id, book_id)
         st.rerun()
 
+
+def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
     delete_feedback = st.session_state.pop("reading_log_delete_feedback", None)
     if delete_feedback:
         st.success(delete_feedback)
 
-    st.subheader("최근 입력 기록")
     logs_df = enrich_logs(read_csv("reading_logs"), members_df, books_df)
     if logs_df.empty:
         st.write("아직 입력된 독서 기록이 없습니다.")
-    else:
-        view = logs_df.sort_values("created_at", ascending=False).head(10)
-        for row in view.itertuples():
-            with st.container(border=True):
-                cols = st.columns([2, 2, 3, 1, 1])
-                with cols[0]:
-                    st.markdown(f"**{row.reading_date}**")
-                    st.caption(row.member_name)
-                with cols[1]:
-                    st.markdown(f"**{row.book_title}**")
-                    st.caption(f"{safe_int(row.pages_read)}쪽 · 가중 {safe_float(row.weighted_pages):.1f}쪽")
-                with cols[2]:
-                    memo_text = str(row.memo or "").strip()
-                    st.write(memo_text if memo_text else "메모 없음")
-                with cols[3]:
-                    if safe_int(row.start_page, 0) or safe_int(row.end_page, 0):
-                        st.caption(f"{safe_int(row.start_page, 0)}~{safe_int(row.end_page, 0)}쪽")
-                    else:
-                        st.caption("페이지 범위 없음")
-                with cols[4]:
-                    pending_delete_id = st.session_state.get("pending_delete_log_id")
-                    if pending_delete_id == str(row.log_id):
-                        st.warning("정말 이 독서 기록을 삭제할까요?")
-                        confirm_col, cancel_col = st.columns(2)
-                        with confirm_col:
-                            if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}"):
-                                original_logs = read_csv("reading_logs")
-                                updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
-                                write_csv("reading_logs", updated_logs)
-                                st.session_state.pop("pending_delete_log_id", None)
-                                st.session_state["reading_log_delete_feedback"] = "독서 기록을 삭제했습니다. 대시보드와 리포트는 삭제된 기록을 기준으로 다시 계산됩니다."
-                                st.rerun()
-                        with cancel_col:
-                            if st.button("취소", key=f"cancel_delete_log_{row.log_id}"):
-                                st.session_state.pop("pending_delete_log_id", None)
-                                st.rerun()
-                    else:
-                        if st.button("삭제", key=f"delete_log_{row.log_id}"):
-                            st.session_state["pending_delete_log_id"] = str(row.log_id)
-                            st.rerun()
-
-
-def page_quotes(data: dict) -> None:
-    st.title("💬 좋았던 문장")
-    members_df = data["family_members"]
-    books_df = data["books"]
-    if members_df.empty or books_df.empty:
-        st.warning("가족 구성원과 책이 필요합니다.")
         return
-    m_options = member_options(members_df)
-    b_options = book_options(books_df)
-    with st.form("quote_form"):
-        member_label = st.selectbox("가족 구성원", list(m_options.keys()))
-        book_label = st.selectbox("책", list(b_options.keys()))
-        page_number = st.number_input("페이지 번호", min_value=0, step=1, value=1)
-        quote_text = st.text_area("좋았던 문장 *")
-        comment = st.text_area("내 생각")
-        submitted = st.form_submit_button("문장 저장")
-    if submitted:
-        if not quote_text.strip():
-            st.error("좋았던 문장을 입력해주세요.")
-        else:
-            row = {
-                "quote_id": make_id("quote"), "member_id": m_options[member_label], "book_id": b_options[book_label],
-                "page_number": page_number, "quote_text": quote_text, "comment": comment, "created_at": now_str(),
-            }
-            quotes_df = pd.concat([data["quotes"], pd.DataFrame([row])], ignore_index=True)
-            write_csv("quotes", quotes_df)
-            st.success("문장을 저장했습니다.")
-            st.rerun()
 
-    st.subheader("저장된 문장")
+    view = logs_df.sort_values("created_at", ascending=False)
+    for row in view.itertuples():
+        with st.container(border=True):
+            cols = st.columns([1.2, 1.5, 2.2, 1.3, 1.2, 2.2, 1.3])
+            with cols[0]:
+                st.markdown(f"**{row.reading_date}**")
+            with cols[1]:
+                st.write(row.member_name)
+            with cols[2]:
+                st.markdown(f"**{row.book_title}**")
+            with cols[3]:
+                st.write(f"{safe_int(row.pages_read)}쪽")
+                st.caption(f"가중 {safe_float(row.weighted_pages):.1f}쪽")
+            with cols[4]:
+                start_page = safe_int(row.start_page, 0)
+                end_page = safe_int(row.end_page, 0)
+                if start_page or end_page:
+                    st.write(f"{start_page}~{end_page}쪽")
+                else:
+                    st.caption("범위 없음")
+            with cols[5]:
+                memo_text = str(row.memo or "").strip()
+                st.write(memo_text if memo_text else "메모 없음")
+            with cols[6]:
+                pending_delete_id = st.session_state.get("pending_delete_log_id")
+                if pending_delete_id == str(row.log_id):
+                    st.warning("정말 이 독서 기록을 삭제할까요?")
+                    confirm_col, cancel_col = st.columns(2)
+                    with confirm_col:
+                        if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}"):
+                            original_logs = read_csv("reading_logs")
+                            updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
+                            write_csv("reading_logs", updated_logs)
+                            st.session_state.pop("pending_delete_log_id", None)
+                            st.session_state["reading_log_delete_feedback"] = "독서 기록을 삭제했습니다. 대시보드와 리포트는 삭제된 기록을 기준으로 다시 계산됩니다."
+                            st.rerun()
+                    with cancel_col:
+                        if st.button("취소", key=f"cancel_delete_log_{row.log_id}"):
+                            st.session_state.pop("pending_delete_log_id", None)
+                            st.rerun()
+                else:
+                    if st.button("이 기록 삭제", key=f"delete_log_{row.log_id}"):
+                        st.session_state["pending_delete_log_id"] = str(row.log_id)
+                        st.rerun()
+
+
+def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
     quotes_df = read_csv("quotes")
     if quotes_df.empty:
         st.write("아직 저장된 문장이 없습니다.")
-    else:
-        for row in quotes_df.sort_values("created_at", ascending=False).itertuples():
-            with st.container(border=True):
-                st.markdown(f"> {row.quote_text}")
-                st.caption(f"{get_member_name(row.member_id, members_df)} · 《{get_book_title(row.book_id, books_df)}》 · p.{row.page_number}")
-                if row.comment:
-                    st.write(row.comment)
-
-
-def page_reviews(data: dict) -> None:
-    st.title("⭐ 한 줄 감상")
-    members_df = data["family_members"]
-    books_df = data["books"]
-    if members_df.empty or books_df.empty:
-        st.warning("가족 구성원과 책이 필요합니다.")
         return
-    m_options = member_options(members_df)
-    b_options = book_options(books_df)
-    with st.form("review_form"):
-        member_label = st.selectbox("가족 구성원", list(m_options.keys()))
-        book_label = st.selectbox("책", list(b_options.keys()))
-        rating = st.slider("별점", 1, 5, 5)
-        one_line_review = st.text_input("한 줄 감상 *")
-        full_review = st.text_area("자세한 감상", placeholder="선택 입력")
-        finished_date = st.date_input("완독일", value=date.today())
-        submitted = st.form_submit_button("감상 저장")
-    if submitted:
-        if not one_line_review.strip():
-            st.error("한 줄 감상을 입력해주세요.")
-        else:
-            row = {
-                "review_id": make_id("review"), "member_id": m_options[member_label], "book_id": b_options[book_label],
-                "rating": rating, "one_line_review": one_line_review, "full_review": full_review,
-                "finished_date": finished_date.isoformat(), "created_at": now_str(),
-            }
-            reviews_df = pd.concat([data["reviews"], pd.DataFrame([row])], ignore_index=True)
-            write_csv("reviews", reviews_df)
-            st.success("감상을 저장했습니다.")
-            st.rerun()
+    for row in quotes_df.sort_values("created_at", ascending=False).itertuples():
+        with st.container(border=True):
+            st.markdown(f"> {row.quote_text}")
+            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · 책: 《{get_book_title(row.book_id, books_df)}》 · p.{safe_int(row.page_number, 0)} · 작성일 {row.created_at}")
+            comment = str(row.comment or "").strip()
+            if comment:
+                st.write(comment)
 
-    st.subheader("감상 목록")
+
+def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame) -> None:
     reviews_df = read_csv("reviews")
     if reviews_df.empty:
         st.write("아직 저장된 감상이 없습니다.")
-    else:
-        for row in reviews_df.sort_values("created_at", ascending=False).itertuples():
-            with st.container(border=True):
-                st.markdown(f"#### {'⭐' * safe_int(row.rating, 0)} 《{get_book_title(row.book_id, books_df)}》")
-                st.write(row.one_line_review)
-                if row.full_review:
-                    st.caption(row.full_review)
-                st.caption(f"{get_member_name(row.member_id, members_df)} · 완독일 {row.finished_date}")
+        return
+    for row in reviews_df.sort_values("created_at", ascending=False).itertuples():
+        with st.container(border=True):
+            st.markdown(f"#### {'⭐' * safe_int(row.rating, 0)} 《{get_book_title(row.book_id, books_df)}》")
+            st.write(row.one_line_review)
+            full_review = str(row.full_review or "").strip()
+            if full_review:
+                st.caption(full_review)
+            finished_date = str(row.finished_date or "").strip()
+            finished_text = f"완독일 {finished_date}" if finished_date else "완독일 미입력"
+            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · {finished_text} · 작성일 {row.created_at}")
+
+
+def page_records(data: dict) -> None:
+    st.title("🗂️ 기록 모아보기")
+    st.caption("입력된 독서 기록, 좋았던 문장, 한 줄 감상을 한곳에서 확인합니다.")
+
+    members_df = read_csv("family_members")
+    books_df = read_csv("books")
+    tab_logs, tab_quotes, tab_reviews = st.tabs(["독서 기록", "좋았던 문장", "한 줄 감상"])
+    with tab_logs:
+        render_reading_logs_tab(members_df, books_df)
+    with tab_quotes:
+        render_quotes_tab(members_df, books_df)
+    with tab_reviews:
+        render_reviews_tab(members_df, books_df)
 
 
 def page_monthly_report(data: dict) -> None:
@@ -1052,6 +1595,35 @@ def page_settings(data: dict) -> None:
             st.success("가족 구성원을 추가했습니다.")
             st.rerun()
 
+
+    st.subheader("국립중앙도서관 페이지 수 조회 테스트")
+    st.caption("선택 기능입니다. 책장 추가 시에는 자동 호출하지 않으며, 이 테스트 버튼을 눌렀을 때만 5초 이내 timeout으로 수동 조회합니다.")
+    with st.expander("개발자용 수동 테스트", expanded=False):
+        test_isbn = st.text_input("테스트 ISBN", placeholder="예: 978-8954677158", key="nlk_manual_test_isbn")
+        if st.button("국립중앙도서관 페이지 수 조회 테스트", key="nlk_manual_test_button"):
+            result = fetch_book_pages_by_isbn_nlk(test_isbn)
+            status = result.get("status", "unknown")
+            pages = result.get("pages")
+            message = result.get("message", "")
+            if status == "success" and pages:
+                st.success(f"조회 성공: 전체 페이지 수 {int(pages)}쪽")
+            elif status == "no_key":
+                st.warning("NLK_CERT_KEY가 없어 조회하지 못했습니다.")
+            elif status == "timeout":
+                st.warning("연결 시간 초과: 현재 네트워크에서는 국립중앙도서관 API 응답을 받지 못했습니다.")
+                st.caption("책 등록 기능에는 영향이 없습니다.")
+            else:
+                st.warning(message or "페이지 수를 확인하지 못했습니다.")
+                st.caption("책 등록 기능에는 영향이 없습니다.")
+            debug = result.get("debug", {}) or {}
+            safe_debug = {k: v for k, v in debug.items() if k != "response_preview"}
+            if safe_debug or debug.get("response_preview"):
+                with st.expander("개발 확인", expanded=False):
+                    if safe_debug:
+                        st.caption(str(safe_debug))
+                    if debug.get("response_preview"):
+                        st.text_area("응답 미리보기", value=str(debug.get("response_preview"))[:1000], height=160, disabled=True)
+
     st.subheader("현재 가족 구성원")
     if data["family_members"].empty:
         st.write("아직 구성원이 없습니다.")
@@ -1068,7 +1640,7 @@ def main() -> None:
         st.title("📚 독서마라톤")
         page = st.radio(
             "메뉴",
-            ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "독서 기록 입력", "좋았던 문장", "한 줄 감상", "월간 리포트", "설정 / 가족 구성원"],
+            ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "오늘의 독서 기록", "기록 모아보기", "월간 리포트", "설정 / 가족 구성원"],
         )
         st.divider()
         st.caption("CSV 저장 방식 MVP")
@@ -1080,12 +1652,10 @@ def main() -> None:
         page_book_search(data)
     elif page == "가족 책장":
         page_library(data)
-    elif page == "독서 기록 입력":
-        page_reading_log(data)
-    elif page == "좋았던 문장":
-        page_quotes(data)
-    elif page == "한 줄 감상":
-        page_reviews(data)
+    elif page == "오늘의 독서 기록":
+        page_today_reading(data)
+    elif page == "기록 모아보기":
+        page_records(data)
     elif page == "월간 리포트":
         page_monthly_report(data)
     elif page == "설정 / 가족 구성원":

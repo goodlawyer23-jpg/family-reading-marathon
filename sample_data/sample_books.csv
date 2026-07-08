@@ -1,8 +1,8 @@
 ﻿book_id,reader_member_id,title,author,publisher,isbn,image_url,description,pubdate,total_pages,source_api,created_at
-book_001,member_mom,긴긴밤,루리,문학동네,9788954677158,https://placehold.co/160x220?text=BOOK,서로 다른 존재들이 함께 길을 걷는 이야기,2021-02-03,144,sample,2026-07-07 21:09:49
-book_002,member_dad,불편한 편의점,김호연,나무옆의자,9791161571188,https://placehold.co/160x220?text=BOOK,동네 편의점에서 만나는 따뜻한 사람들의 이야기,2021-04-20,268,sample,2026-07-07 21:09:49
-book_003,member_dad,아몬드,손원평,창비,9788936434267,https://placehold.co/160x220?text=BOOK,감정을 느끼기 어려운 소년의 성장 이야기,2017-03-31,264,sample,2026-07-07 21:09:49
-book_004,member_child2,수박 수영장,안녕달,창비,9788936446819,https://placehold.co/160x220?text=BOOK,여름날 수박 속에서 펼쳐지는 상상 그림책,2015-07-30,52,sample,2026-07-07 21:09:49
-book_005,member_child2,강아지똥,권정생,길벗어린이,9788986621135,https://placehold.co/160x220?text=BOOK,작고 낮은 존재의 소중함을 알려주는 그림책,1996-04-01,36,sample,2026-07-07 21:09:49
-book_006,member_child1,해리 포터와 마법사의 돌,J.K. 롤링,문학수첩,9788983927620,https://placehold.co/160x220?text=BOOK,마법 학교에서 시작되는 모험,2019-11-19,268,sample,2026-07-07 21:09:49
-book_007,member_child2,채소 학교와 쌍둥이 딸기,나카야 미와,웅진주니어,9788901253541,https://placehold.co/160x220?text=BOOK,채소 친구들이 등장하는 귀여운 그림책,2021-06-30,40,sample,2026-07-07 21:09:49
+book_001,member_mom,긴긴밤,루리,문학동네,9788954677158,https://placehold.co/160x220?text=BOOK,서로 다른 존재들이 함께 길을 걷는 이야기,2021-02-03,144,sample,2026-07-08 00:42:11
+book_002,member_dad,불편한 편의점,김호연,나무옆의자,9791161571188,https://placehold.co/160x220?text=BOOK,동네 편의점에서 만나는 따뜻한 사람들의 이야기,2021-04-20,268,sample,2026-07-08 00:42:11
+book_003,member_dad,아몬드,손원평,창비,9788936434267,https://placehold.co/160x220?text=BOOK,감정을 느끼기 어려운 소년의 성장 이야기,2017-03-31,264,sample,2026-07-08 00:42:11
+book_004,member_child2,수박 수영장,안녕달,창비,9788936446819,https://placehold.co/160x220?text=BOOK,여름날 수박 속에서 펼쳐지는 상상 그림책,2015-07-30,52,sample,2026-07-08 00:42:11
+book_005,member_child2,강아지똥,권정생,길벗어린이,9788986621135,https://placehold.co/160x220?text=BOOK,작고 낮은 존재의 소중함을 알려주는 그림책,1996-04-01,36,sample,2026-07-08 00:42:11
+book_006,member_child1,해리 포터와 마법사의 돌,J.K. 롤링,문학수첩,9788983927620,https://placehold.co/160x220?text=BOOK,마법 학교에서 시작되는 모험,2019-11-19,268,sample,2026-07-08 00:42:11
+book_007,member_child2,채소 학교와 쌍둥이 딸기,나카야 미와,웅진주니어,9788901253541,https://placehold.co/160x220?text=BOOK,채소 친구들이 등장하는 귀여운 그림책,2021-06-30,40,sample,2026-07-08 00:42:11
