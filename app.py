@@ -89,6 +89,69 @@ AGE_GROUP_OPTIONS = ["성인", "청소년", "어린이", "유아"]
 DEFAULT_WEIGHT_BY_AGE = {"성인": 1.0, "청소년": 1.1, "어린이": 1.4, "유아": 2.0}
 
 
+def get_admin_password() -> str:
+    """Streamlit Secrets 또는 환경변수에서 관리자 비밀번호를 읽습니다."""
+    secret_value = ""
+    try:
+        secret_value = str(st.secrets.get("ADMIN_PASSWORD", "") or "").strip()
+    except Exception:
+        secret_value = ""
+    env_value = str(os.getenv("ADMIN_PASSWORD", "") or "").strip()
+    return secret_value or env_value
+
+
+def is_admin_password_configured() -> bool:
+    return bool(get_admin_password())
+
+
+def is_admin() -> bool:
+    """ADMIN_PASSWORD가 없으면 로컬 개발 편의를 위해 관리자 권한을 허용합니다."""
+    if not is_admin_password_configured():
+        return True
+    return bool(st.session_state.get("is_admin", False))
+
+
+def admin_disabled_help() -> str:
+    return "관리자 모드에서만 사용할 수 있습니다."
+
+
+def render_admin_mode_panel() -> None:
+    """사이드바 관리자 모드 로그인 패널."""
+    admin_password = get_admin_password()
+    st.markdown("### 🔐 관리자 모드")
+
+    if not admin_password:
+        st.session_state["is_admin"] = True
+        st.warning("ADMIN_PASSWORD가 설정되어 있지 않아 현재는 쓰기 기능이 허용됩니다. 공개 배포 시 Streamlit Secrets에 ADMIN_PASSWORD를 설정해주세요.")
+        return
+
+    if st.session_state.get("is_admin", False):
+        st.success("관리자 모드 ON")
+        if st.button("관리자 모드 종료", key="admin_logout_button", use_container_width=True):
+            st.session_state["is_admin"] = False
+            st.rerun()
+        return
+
+    with st.form("admin_login_form"):
+        password_input = st.text_input("관리자 비밀번호", type="password", placeholder="비밀번호 입력")
+        submitted = st.form_submit_button("관리자 모드 켜기", use_container_width=True)
+
+    if submitted:
+        if password_input == admin_password:
+            st.session_state["is_admin"] = True
+            st.success("관리자 모드가 켜졌습니다.")
+            st.rerun()
+        else:
+            st.error("비밀번호가 맞지 않습니다.")
+
+    st.caption("관리자 모드가 아닐 때는 책 추가, 기록 저장, 삭제, 초기화 등 변경 기능이 제한됩니다.")
+
+
+def render_read_only_notice(scope: str = "이 화면") -> None:
+    if not is_admin():
+        st.info(f"읽기 전용 모드입니다. {scope}의 추가·수정·삭제 기능은 관리자 모드에서만 사용할 수 있습니다.")
+
+
 def recommended_weight(age_group: str) -> float:
     return DEFAULT_WEIGHT_BY_AGE.get(str(age_group).strip(), 1.0)
 
@@ -1425,6 +1488,7 @@ def page_dashboard(data: dict) -> None:
 
 def page_book_search(data: dict) -> None:
     st.title("🔎 책 검색 / 책 등록")
+    render_read_only_notice("책 검색 / 책 등록")
     st.caption(".env 또는 Streamlit Secrets에 네이버 API 키가 있으면 네이버 책 검색을 먼저 사용하고, 실패하면 샘플 검색으로 자동 전환합니다.")
 
     members_df = data["family_members"]
@@ -1572,7 +1636,7 @@ def page_book_search(data: dict) -> None:
                                 st.write(description)
                         else:
                             st.caption("책 소개 없음")
-                        if st.button(f"{selected_reader_label}의 책장에 추가", key=f"add_search_{global_idx}_{selected_reader_id}"):
+                        if st.button(f"{selected_reader_label}의 책장에 추가", key=f"add_search_{global_idx}_{selected_reader_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                             book_to_add = dict(book)
                             book_to_add.update({
                                 "title": title,
@@ -1614,7 +1678,7 @@ def page_book_search(data: dict) -> None:
             description = st.text_area("책 소개")
             pubdate = st.text_input("출간일", placeholder="YYYY-MM-DD 또는 YYYYMMDD")
             total_pages = st.number_input("전체 페이지 수", min_value=0, step=1, value=100)
-            submitted = st.form_submit_button("직접 등록")
+            submitted = st.form_submit_button("직접 등록", disabled=not is_admin())
         if submitted:
             if not title.strip():
                 st.error("제목은 필수입니다.")
@@ -1634,6 +1698,7 @@ def page_book_search(data: dict) -> None:
 
 def page_library(data: dict) -> None:
     st.title("📚 가족 책장")
+    render_read_only_notice("가족 책장")
     st.caption("책을 추가할 때 선택한 러너가 바로 표시됩니다. 독서 기록을 아직 입력하지 않아도 러너별 책장을 확인할 수 있습니다.")
     # 책장 화면은 저장 직후 갱신 UX가 중요하므로, 전달받은 data 대신 CSV를 한 번 더 읽어 최신 상태를 보장합니다.
     all_books_df = read_csv("books")
@@ -1712,7 +1777,7 @@ def page_library(data: dict) -> None:
                             value=max(0, safe_int(total_pages, 0)),
                             key=f"library_total_pages_{book['book_id']}",
                         )
-                        if st.button("전체 페이지 수 저장", key=f"save_total_pages_{book['book_id']}"):
+                        if st.button("전체 페이지 수 저장", key=f"save_total_pages_{book['book_id']}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                             latest_books_df = read_csv("books")
                             mask = latest_books_df["book_id"].astype(str) == str(book["book_id"])
                             if "marathon_id" in latest_books_df.columns:
@@ -1762,7 +1827,7 @@ def page_library(data: dict) -> None:
                                     index=current_index,
                                     key=f"change_reader_{book_id}",
                                 )
-                                if st.button("러너 변경 저장", key=f"save_reader_{book_id}"):
+                                if st.button("러너 변경 저장", key=f"save_reader_{book_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                                     ok, message = update_book_reader(book_id, runner_options[selected_runner_label], selected_marathon_id)
                                     st.session_state["library_manage_feedback"] = ("success" if ok else "warning", message)
                                     st.rerun()
@@ -1778,7 +1843,7 @@ def page_library(data: dict) -> None:
                                 st.warning("정말 이 책을 책장에서 제거할까요?")
                                 confirm_col, cancel_col = st.columns(2)
                                 with confirm_col:
-                                    if st.button("제거 확인", key=f"confirm_remove_book_{book_id}", type="primary"):
+                                    if st.button("제거 확인", key=f"confirm_remove_book_{book_id}", type="primary", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                                         ok, message = remove_book_from_library(book_id, selected_marathon_id)
                                         st.session_state.pop("pending_remove_book_id", None)
                                         if ok:
@@ -1791,13 +1856,14 @@ def page_library(data: dict) -> None:
                                         st.session_state.pop("pending_remove_book_id", None)
                                         st.rerun()
                             else:
-                                if st.button("책장에서 제거", key=f"request_remove_book_{book_id}"):
+                                if st.button("책장에서 제거", key=f"request_remove_book_{book_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                                     st.session_state["pending_remove_book_id"] = book_id
                                     st.rerun()
 
 
 def page_today_reading(data: dict) -> None:
     st.title("✍️ 오늘의 독서 기록")
+    render_read_only_notice("오늘의 독서 기록")
     st.caption("읽은 페이지는 필수로 기록하고, 좋았던 문장은 선택으로 남깁니다. 별점과 감상은 책을 완독했을 때 기록합니다.")
 
     feedback = st.session_state.pop("today_save_feedback", None)
@@ -1963,7 +2029,7 @@ def page_today_reading(data: dict) -> None:
         st.caption("완독했을 때만 별점과 한 줄 감상을 저장합니다.")
 
     st.markdown("### 6단계. 저장")
-    if st.button("오늘의 기록 저장", type="primary", use_container_width=True, key=f"save_today_{member_id}_{book_id}"):
+    if st.button("오늘의 기록 저장", type="primary", use_container_width=True, key=f"save_today_{member_id}_{book_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
         if record_method == "시작/끝 페이지로 계산" and int(end_page) < int(start_page):
             st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
             return
@@ -2086,7 +2152,7 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, ma
                     st.warning("정말 이 독서 기록을 삭제할까요?")
                     confirm_col, cancel_col = st.columns(2)
                     with confirm_col:
-                        if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}"):
+                        if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                             original_logs = read_csv("reading_logs")
                             updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
                             write_csv("reading_logs", updated_logs)
@@ -2098,7 +2164,7 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, ma
                             st.session_state.pop("pending_delete_log_id", None)
                             st.rerun()
                 else:
-                    if st.button("이 기록 삭제", key=f"delete_log_{row.log_id}"):
+                    if st.button("이 기록 삭제", key=f"delete_log_{row.log_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         st.session_state["pending_delete_log_id"] = str(row.log_id)
                         st.rerun()
 
@@ -2133,7 +2199,7 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon
                 pending_delete_id = st.session_state.get("pending_delete_quote_id")
                 if pending_delete_id == str(row.quote_id):
                     st.warning("정말 이 문장을 삭제할까요?")
-                    if st.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}"):
+                    if st.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         original_quotes = read_csv("quotes")
                         updated_quotes = original_quotes[original_quotes["quote_id"].astype(str) != str(row.quote_id)].copy()
                         write_csv("quotes", updated_quotes)
@@ -2144,7 +2210,7 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon
                         st.session_state.pop("pending_delete_quote_id", None)
                         st.rerun()
                 else:
-                    if st.button("문장 삭제", key=f"delete_quote_{row.quote_id}"):
+                    if st.button("문장 삭제", key=f"delete_quote_{row.quote_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         st.session_state["pending_delete_quote_id"] = str(row.quote_id)
                         st.rerun()
 
@@ -2178,7 +2244,7 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, maratho
                 pending_delete_id = st.session_state.get("pending_delete_review_id")
                 if pending_delete_id == str(row.review_id):
                     st.warning("정말 이 감상을 삭제할까요?")
-                    if st.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}"):
+                    if st.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         original_reviews = read_csv("reviews")
                         updated_reviews = original_reviews[original_reviews["review_id"].astype(str) != str(row.review_id)].copy()
                         write_csv("reviews", updated_reviews)
@@ -2189,13 +2255,14 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, maratho
                         st.session_state.pop("pending_delete_review_id", None)
                         st.rerun()
                 else:
-                    if st.button("감상 삭제", key=f"delete_review_{row.review_id}"):
+                    if st.button("감상 삭제", key=f"delete_review_{row.review_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         st.session_state["pending_delete_review_id"] = str(row.review_id)
                         st.rerun()
 
 
 def page_records(data: dict) -> None:
     st.title("🗂️ 기록 모아보기")
+    render_read_only_notice("기록 모아보기")
     st.caption("선택한 독서마라톤의 독서 기록, 좋았던 문장, 한 줄 감상을 한곳에서 확인합니다.")
 
     settings_df = read_csv("settings")
@@ -2292,7 +2359,7 @@ def page_settings(data: dict) -> None:
     with st.expander("🛠️ 개발/시연용 도구", expanded=False):
         st.caption("발표 시연이나 초기 테스트가 필요할 때만 사용하세요. 기존 CSV 데이터가 샘플 데이터로 초기화됩니다.")
         st.warning("샘플 데이터 생성 / 전체 초기화는 기존 기록을 덮어쓰는 개발·시연용 기능입니다. 실제 사용 중 새 달을 시작할 때는 아래의 '새 독서마라톤 시작' 기능을 사용해주세요.")
-        if st.button("🎁 샘플 데이터 생성 / 전체 초기화", type="primary", key="settings_create_sample_data"):
+        if st.button("🎁 샘플 데이터 생성 / 전체 초기화", type="primary", key="settings_create_sample_data", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
             create_sample_data()
             st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
             st.rerun()
@@ -2305,7 +2372,7 @@ def page_settings(data: dict) -> None:
         end_date = st.date_input("종료일", value=pd.to_datetime(settings["end_date"]).date())
         family_target_pages = st.number_input("가족 목표 페이지", min_value=1, step=100, value=safe_int(settings["family_target_pages"], 2000))
         unit_name = st.text_input("단위명", value=settings["unit_name"])
-        submitted = st.form_submit_button("현재 마라톤 설정 저장")
+        submitted = st.form_submit_button("현재 마라톤 설정 저장", disabled=not is_admin())
     if submitted:
         latest_settings = read_csv("settings")
         active_id = settings["marathon_id"]
@@ -2334,7 +2401,7 @@ def page_settings(data: dict) -> None:
         new_end = c2.date_input("종료일", value=new_end_default, key="new_marathon_end")
         new_target = st.number_input("가족 목표 페이지", min_value=1, step=100, value=marathon_defaults["target"], key="new_marathon_target")
         new_unit = st.text_input("단위명", value=marathon_defaults["unit"], key="new_marathon_unit")
-        new_submitted = st.form_submit_button("새 마라톤 시작하기", type="primary")
+        new_submitted = st.form_submit_button("새 마라톤 시작하기", type="primary", disabled=not is_admin())
     if new_submitted:
         if new_end < new_start:
             st.error("종료일은 시작일보다 빠를 수 없습니다.")
@@ -2370,7 +2437,7 @@ def page_settings(data: dict) -> None:
             selected_mid = marathon_options[selected_label]
             selected_is_active = selected_mid == active_mid
             c1, c2 = st.columns(2)
-            if c1.button("이 마라톤을 진행 중으로 선택", disabled=selected_is_active, key="set_active_marathon_button"):
+            if c1.button("이 마라톤을 진행 중으로 선택", disabled=(selected_is_active or not is_admin()), key="set_active_marathon_button", help=None if is_admin() else admin_disabled_help()):
                 set_active_marathon(selected_mid)
                 st.success("선택한 독서마라톤을 현재 진행 중으로 변경했습니다.")
                 st.rerun()
@@ -2380,7 +2447,7 @@ def page_settings(data: dict) -> None:
             if pending_delete_mid == selected_mid:
                 st.warning("정말 이 독서마라톤을 삭제할까요? 러너는 유지되지만, 이 마라톤의 책장·독서 기록·문장·완독 감상은 함께 삭제됩니다.")
                 d1, d2 = st.columns(2)
-                if d1.button("삭제 확인", key="confirm_delete_marathon", type="primary"):
+                if d1.button("삭제 확인", key="confirm_delete_marathon", type="primary", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                     result = delete_marathon_and_related_data(selected_mid)
                     st.session_state.pop(delete_key, None)
                     if result.get("error"):
@@ -2397,7 +2464,7 @@ def page_settings(data: dict) -> None:
                     st.info("독서마라톤 삭제를 취소했습니다.")
                     st.rerun()
             else:
-                if c2.button("이 마라톤 삭제", key="request_delete_marathon"):
+                if c2.button("이 마라톤 삭제", key="request_delete_marathon", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                     st.session_state[delete_key] = selected_mid
                     st.rerun()
 
@@ -2419,7 +2486,7 @@ def page_settings(data: dict) -> None:
             key=f"new_runner_weight_{age_group}",
             help="기본값: 성인 1.0, 청소년 1.1, 어린이 1.4, 유아 2.0",
         )
-        member_submit = st.form_submit_button("새 러너 추가")
+        member_submit = st.form_submit_button("새 러너 추가", disabled=not is_admin())
     if member_submit:
         if not name.strip():
             st.error("러너 이름을 입력해주세요.")
@@ -2472,7 +2539,7 @@ def page_settings(data: dict) -> None:
                         value=safe_float(member.get("weight", 1.0), 1.0),
                         key=f"edit_weight_{member_id}",
                     )
-                    edit_submitted = st.form_submit_button("러너 정보 저장")
+                    edit_submitted = st.form_submit_button("러너 정보 저장", disabled=not is_admin())
                 if edit_submitted:
                     if not edited_name.strip():
                         st.error("러너 이름을 입력해주세요.")
@@ -2500,7 +2567,7 @@ def page_settings(data: dict) -> None:
                 if pending_delete_id == member_id:
                     st.warning(f"정말 {current_avatar} {member.get('name', '러너')} 러너를 삭제할까요? 이 작업은 되돌릴 수 없습니다.")
                     c1, c2 = st.columns(2)
-                    if c1.button("삭제 확인", key=f"confirm_delete_member_{member_id}", type="primary"):
+                    if c1.button("삭제 확인", key=f"confirm_delete_member_{member_id}", type="primary", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         result = delete_runner_and_related_data(member_id)
                         st.session_state.pop(delete_state_key, None)
                         st.success(
@@ -2514,7 +2581,7 @@ def page_settings(data: dict) -> None:
                         st.info("러너 삭제를 취소했습니다.")
                         st.rerun()
                 else:
-                    if st.button("이 러너 삭제", key=f"request_delete_member_{member_id}"):
+                    if st.button("이 러너 삭제", key=f"request_delete_member_{member_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         st.session_state[delete_state_key] = member_id
                         st.rerun()
 
@@ -2522,7 +2589,7 @@ def page_settings(data: dict) -> None:
     st.caption("선택 기능입니다. 책장 추가 시에는 자동 호출하지 않으며, 이 테스트 버튼을 눌렀을 때만 5초 이내 timeout으로 수동 조회합니다.")
     with st.expander("개발자용 수동 테스트", expanded=False):
         test_isbn = st.text_input("테스트 ISBN", placeholder="예: 978-8954677158", key="nlk_manual_test_isbn")
-        if st.button("국립중앙도서관 페이지 수 조회 테스트", key="nlk_manual_test_button"):
+        if st.button("국립중앙도서관 페이지 수 조회 테스트", key="nlk_manual_test_button", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
             result = fetch_book_pages_by_isbn_nlk(test_isbn)
             status = result.get("status", "unknown")
             pages = result.get("pages")
@@ -2555,6 +2622,8 @@ def main() -> None:
 
     with st.sidebar:
         st.title("📚 독서마라톤")
+        render_admin_mode_panel()
+        st.divider()
         page = st.radio(
             "메뉴",
             ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "오늘의 독서 기록", "기록 모아보기", "월간 리포트", "설정 / 러너 관리"],
