@@ -10,7 +10,7 @@
 
 ## 🔗 바로가기
 
-- **Streamlit 앱 실행하기:** [`https://family-reading-marathon.streamlit.app/`](https://family-reading-marathon.streamlit.app/)
+- **Streamlit 앱 실행하기:** https://family-reading-marathon.streamlit.app/
 - **프로젝트 발표 자료:** [`docs/PRESENTATION_OUTLINE.md`](docs/PRESENTATION_OUTLINE.md)
 - **프로젝트 브리프:** [`docs/PROJECT_BRIEF.md`](docs/PROJECT_BRIEF.md)
 - **MVP 명세:** [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md)
@@ -220,15 +220,9 @@ streamlit run app.py
 
 아래 주소에서 배포된 앱을 확인할 수 있습니다.
 
-```text
-https://여기에-Streamlit-Community-Cloud-주소를-입력하세요
-```
+https://family-reading-marathon.streamlit.app/
 
-예시:
-
-```text
-https://family-reading-marathon.streamlit.app
-```
+Streamlit Community Cloud에 배포된 공개 앱입니다. 일부 자동 평가 도구에서는 Streamlit 인증 리다이렉트가 발생할 수 있으므로, 접속이 안 될 경우 일반 브라우저에서 직접 열어 확인해 주세요.
 
 ---
 
