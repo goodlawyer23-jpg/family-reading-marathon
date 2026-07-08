@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>우리가족 독서마라톤</title>
+  <meta name="description" content="가족이 함께 책을 읽고 기록하며 하나의 결승선을 향해 달리는 협동 독서마라톤 Streamlit 웹앱 소개 페이지" />
+  <style>
+    :root {
+      --bg: #f6f8fc;
+      --card: #ffffff;
+      --ink: #202434;
+      --muted: #667085;
+      --brand: #0b63ce;
+      --brand-dark: #084a99;
+      --soft: #e8f1ff;
+      --line: #d9e2f1;
+      --accent: #ffb020;
+      --green: #16a34a;
+      --shadow: 0 18px 50px rgba(28, 39, 76, 0.08);
+      --radius: 24px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", "Apple SD Gothic Neo", Arial, sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at top left, #eaf3ff 0, #f6f8fc 34%, #fbfcff 100%);
+      line-height: 1.7;
+    }
+
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap {
+      width: min(1120px, calc(100% - 36px));
+      margin: 0 auto;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(14px);
+      background: rgba(246, 248, 252, 0.86);
+      border-bottom: 1px solid rgba(217, 226, 241, 0.8);
+    }
+
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 14px 0;
+    }
+
+    .logo {
+      font-weight: 900;
+      letter-spacing: -0.03em;
+      font-size: 1.08rem;
+      white-space: nowrap;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      font-size: 0.92rem;
+    }
+
+    .hero {
+      padding: 72px 0 42px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 28px;
+      align-items: center;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.8);
+      border-radius: 999px;
+      color: var(--brand-dark);
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    h1 {
+      margin: 22px 0 14px;
+      font-size: clamp(2.4rem, 6vw, 4.8rem);
+      line-height: 1.05;
+      letter-spacing: -0.08em;
+    }
+
+    .lead {
+      font-size: clamp(1.08rem, 2vw, 1.35rem);
+      color: #344054;
+      max-width: 720px;
+      margin: 0 0 24px;
+    }
+
+    .cta-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 28px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border-radius: 14px;
+      padding: 13px 18px;
+      font-weight: 800;
+      border: 1px solid transparent;
+      box-shadow: 0 8px 22px rgba(11, 99, 206, 0.16);
+    }
+
+    .btn.primary {
+      background: var(--brand);
+      color: white;
+    }
+
+    .btn.secondary {
+      background: white;
+      color: var(--brand-dark);
+      border-color: var(--line);
+      box-shadow: none;
+    }
+
+    .hero-card {
+      background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 26px;
+    }
+
+    .track-label {
+      display: flex;
+      justify-content: space-between;
+      font-weight: 900;
+      color: var(--brand-dark);
+      margin-bottom: 12px;
+    }
+
+    .track {
+      position: relative;
+      height: 18px;
+      background: #dce7f8;
+      border-radius: 999px;
+      overflow: hidden;
+      margin: 14px 0 28px;
+    }
+
+    .track .fill {
+      width: 62%;
+      height: 100%;
+      background: linear-gradient(90deg, #0b63ce, #4da3ff);
+      border-radius: inherit;
+    }
+
+    .runner {
+      position: absolute;
+      left: calc(62% - 18px);
+      top: -17px;
+      font-size: 2rem;
+    }
+
+    .mini-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+
+    .mini-stat {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+    }
+
+    .mini-stat strong {
+      display: block;
+      font-size: 1.6rem;
+      letter-spacing: -0.04em;
+      line-height: 1.1;
+    }
+
+    .mini-stat span {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    section { padding: 38px 0; }
+
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+
+    h2 {
+      font-size: clamp(1.7rem, 3vw, 2.4rem);
+      margin: 0;
+      letter-spacing: -0.05em;
+    }
+
+    .section-desc {
+      color: var(--muted);
+      margin: 8px 0 0;
+      max-width: 720px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 22px;
+      box-shadow: 0 10px 30px rgba(28, 39, 76, 0.05);
+    }
+
+    .card .icon {
+      font-size: 2rem;
+      margin-bottom: 12px;
+    }
+
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 1.12rem;
+      letter-spacing: -0.03em;
+    }
+
+    .card p, .card li { color: var(--muted); }
+    .card p { margin: 0; }
+
+    .steps {
+      counter-reset: step;
+      display: grid;
+      gap: 12px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: 14px;
+      align-items: start;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 18px;
+    }
+
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--soft);
+      color: var(--brand-dark);
+      font-weight: 900;
+      display: grid;
+      place-items: center;
+    }
+
+    .step h3 { margin: 0 0 4px; }
+    .step p { margin: 0; color: var(--muted); }
+
+    .screens {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px;
+    }
+
+    figure {
+      margin: 0;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(28, 39, 76, 0.05);
+    }
+
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #eef3fb;
+    }
+
+    figcaption {
+      padding: 14px 16px;
+      font-weight: 800;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    .pill-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 0;
+      list-style: none;
+      margin: 16px 0 0;
+    }
+
+    .pill-list li {
+      background: var(--soft);
+      color: var(--brand-dark);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-weight: 800;
+      font-size: 0.92rem;
+    }
+
+    .notice {
+      background: #fff7e6;
+      border: 1px solid #ffd48a;
+      border-radius: 18px;
+      padding: 16px 18px;
+      color: #7a4b00;
+      margin-top: 18px;
+    }
+
+    footer {
+      padding: 42px 0 58px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 860px) {
+      .hero-grid, .grid, .screens, .two-col { grid-template-columns: 1fr; }
+      .mini-stats { grid-template-columns: 1fr; }
+      .nav { align-items: flex-start; flex-direction: column; }
+      .nav-links { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap nav">
+      <div class="logo">🏁 우리가족 독서마라톤</div>
+      <nav class="nav-links" aria-label="주요 메뉴">
+        <a href="#features">기능</a>
+        <a href="#demo">데모 흐름</a>
+        <a href="#screenshots">화면</a>
+        <a href="#tech">기술</a>
+        <a href="#future">확장</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <span class="badge">🤝 가족이 함께 달리는 협동 독서마라톤</span>
+          <h1>우리가족<br />독서마라톤</h1>
+          <p class="lead">
+            가족 구성원이 각자 읽는 책과 페이지 수, 좋았던 문장, 완독 감상을 기록하고
+            가족 전체의 독서 목표 달성 과정을 마라톤처럼 시각화하는 Streamlit 웹앱입니다.
+          </p>
+          <div class="cta-row">
+            <a class="btn primary" href="https://family-reading-marathon.streamlit.app/" target="_blank" rel="noopener">🚀 Streamlit 앱 열기</a>
+            <a class="btn secondary" href="https://github.com/goodlawyer23-jpg/family-reading-marathon" target="_blank" rel="noopener">GitHub 저장소 보기</a>
+          </div>
+          <div class="notice">
+            Streamlit Community Cloud에 배포된 공개 앱입니다. 일부 자동 평가 도구에서는 인증 리다이렉트가 발생할 수 있으므로, 접속이 안 될 경우 일반 브라우저에서 직접 열어 확인해 주세요.
+          </div>
+        </div>
+        <div class="hero-card" aria-label="마라톤 진행률 예시">
+          <div class="track-label"><span>START</span><span>GOAL</span></div>
+          <div class="track"><div class="fill"></div><div class="runner">🏃‍➡️</div></div>
+          <h2>우리 가족은 결승선까지 62% 왔어요!</h2>
+          <p class="section-desc">순위 경쟁이 아니라, 가족이 함께 2,000쪽 목표를 향해 달리는 협동 미션입니다.</p>
+          <div class="mini-stats" style="margin-top: 20px;">
+            <div class="mini-stat"><span>가족 목표</span><strong>2,000쪽</strong></div>
+            <div class="mini-stat"><span>누적 기록</span><strong>1,240쪽</strong></div>
+            <div class="mini-stat"><span>남은 거리</span><strong>760쪽</strong></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>핵심 기능</h2>
+            <p class="section-desc">책 검색부터 기록, 책장 관리, 월간 리포트, 새 마라톤 시작까지 실제 가족 사용 흐름을 MVP로 구현했습니다.</p>
+          </div>
+        </div>
+        <div class="grid">
+          <article class="card"><div class="icon">📊</div><h3>홈 대시보드</h3><p>가족 전체 목표, 누적 페이지, 남은 거리, 협동 기여도를 마라톤 트랙으로 확인합니다.</p></article>
+          <article class="card"><div class="icon">🔎</div><h3>책 검색 / 등록</h3><p>네이버 책 검색 API로 제목·ISBN 검색을 지원하고, API 실패 시 샘플 검색으로 대체합니다.</p></article>
+          <article class="card"><div class="icon">📚</div><h3>가족 책장</h3><p>러너별 책장, 진행률, 완독 상태를 표시하고 기록 없는 책은 제거·러너 변경이 가능합니다.</p></article>
+          <article class="card"><div class="icon">✍️</div><h3>오늘의 독서 기록</h3><p>시작/끝 페이지로 읽은 쪽수를 자동 계산하고, 좋았던 문장과 완독 감상을 함께 저장합니다.</p></article>
+          <article class="card"><div class="icon">🗂️</div><h3>기록 모아보기</h3><p>독서 기록, 좋았던 문장, 완독 감상을 마라톤별로 확인하고 삭제 전 확인 후 정리합니다.</p></article>
+          <article class="card"><div class="icon">🏁</div><h3>새 마라톤 시작</h3><p>기존 기록은 보존하고, 새 독서마라톤을 시작하거나 과거 마라톤을 다시 선택할 수 있습니다.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="demo">
+      <div class="wrap">
+        <h2>추천 데모 시나리오</h2>
+        <p class="section-desc">앱이 직접 열리지 않아도 아래 흐름만으로 서비스 사용 방식을 이해할 수 있습니다.</p>
+        <div class="steps" style="margin-top: 20px;">
+          <div class="step"><div><h3>홈 대시보드 확인</h3><p>가족 목표, 전체 진행률, 마라톤 트랙, 러너별 협동 기여도를 확인합니다.</p></div></div>
+          <div class="step"><div><h3>책 검색 및 책장 추가</h3><p>책 제목 또는 ISBN으로 검색하고, 전체 페이지 수와 읽을 러너를 선택해 책장에 담습니다.</p></div></div>
+          <div class="step"><div><h3>오늘의 독서 기록</h3><p>러너와 책을 선택하고 시작/끝 페이지를 입력해 읽은 거리를 저장합니다.</p></div></div>
+          <div class="step"><div><h3>좋았던 문장과 완독 감상</h3><p>필요할 때만 문장, 생각, 별점, 한 줄 감상을 함께 남깁니다.</p></div></div>
+          <div class="step"><div><h3>월간 리포트 확인</h3><p>선택한 마라톤의 총 페이지, 달성률, 완독한 책, 이달의 문장을 확인합니다.</p></div></div>
+          <div class="step"><div><h3>새 독서마라톤 시작</h3><p>기존 기록을 보존한 채 다음 달 마라톤을 시작하고 과거 마라톤도 다시 볼 수 있습니다.</p></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="screenshots">
+      <div class="wrap">
+        <h2>화면 캡처</h2>
+        <p class="section-desc">README와 동일한 `docs/images/` 경로의 이미지를 사용합니다.</p>
+        <div class="screens" style="margin-top: 20px;">
+          <figure><img src="images/home_dashboard.png" alt="홈 대시보드 화면" loading="lazy"><figcaption>홈 / 대시보드</figcaption></figure>
+          <figure><img src="images/book_search.png" alt="책 검색 화면" loading="lazy"><figcaption>책 검색 / 책 등록</figcaption></figure>
+          <figure><img src="images/library.png" alt="가족 책장 화면" loading="lazy"><figcaption>가족 책장</figcaption></figure>
+          <figure><img src="images/today_log.png" alt="오늘의 독서 기록 화면" loading="lazy"><figcaption>오늘의 독서 기록</figcaption></figure>
+          <figure><img src="images/records.png" alt="기록 모아보기 화면" loading="lazy"><figcaption>기록 모아보기</figcaption></figure>
+          <figure><img src="images/monthly_report.png" alt="월간 리포트 화면" loading="lazy"><figcaption>월간 리포트</figcaption></figure>
+          <figure><img src="images/runner_settings.png" alt="러너 관리 화면" loading="lazy"><figcaption>설정 / 러너 관리</figcaption></figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="tech">
+      <div class="wrap two-col">
+        <article class="card">
+          <h2>기술 스택</h2>
+          <ul class="pill-list">
+            <li>Python</li><li>Streamlit</li><li>pandas</li><li>requests</li><li>python-dotenv</li><li>CSV</li><li>GitHub</li><li>Streamlit Cloud</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>API 활용</h2>
+          <p>네이버 책 검색 API로 책 제목, 저자, 출판사, ISBN, 표지, 소개, 출간일을 불러옵니다. API 키가 없거나 호출에 실패해도 샘플 데이터 기반으로 검색과 등록이 가능합니다.</p>
+          <p style="margin-top: 12px;">국립중앙도서관 ISBN API는 네트워크 환경에 따라 불안정할 수 있어 자동 호출하지 않고, 개발자용 수동 테스트 기능으로 분리했습니다.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="future">
+      <div class="wrap">
+        <h2>향후 확장 방향</h2>
+        <div class="grid" style="margin-top: 20px;">
+          <article class="card"><h3>데이터 저장 확장</h3><p>CSV에서 SQLite, Google Sheets, Supabase, Firebase 등으로 확장할 수 있습니다.</p></article>
+          <article class="card"><h3>게임화 요소</h3><p>배지, 협동 미션, 이벤트 기간 보너스, 아이템, 완주 인증서로 독서마라톤 경험을 강화할 수 있습니다.</p></article>
+          <article class="card"><h3>AI 기능</h3><p>가족 독서 리포트 자동 생성, 아이 수준별 질문 추천, 문장 기반 대화 주제 추천 등을 검토할 수 있습니다.</p></article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <strong>우리가족 독서마라톤</strong><br />
+      작지만 실제로 작동하는 가족 독서 기록 MVP
+    </div>
+  </footer>
+</body>
+</html>
