@@ -541,6 +541,14 @@ def get_book_title(book_id: str, books_df: pd.DataFrame) -> str:
     return str(found.iloc[0].get("title", "알 수 없는 책"))
 
 
+def get_book_total_pages(book_id: str, books_df: pd.DataFrame) -> int:
+    """책장에 저장된 전체 페이지 수를 안전하게 정수로 반환합니다."""
+    found = books_df[books_df["book_id"].astype(str) == str(book_id)] if "book_id" in books_df.columns else pd.DataFrame()
+    if found.empty:
+        return 0
+    return safe_int(found.iloc[0].get("total_pages", 0), 0)
+
+
 def enrich_logs(logs_df: pd.DataFrame, members_df: pd.DataFrame, books_df: pd.DataFrame) -> pd.DataFrame:
     if logs_df.empty:
         return logs_df.copy()
@@ -1919,6 +1927,11 @@ def page_today_reading(data: dict) -> None:
 
     book_id = member_books_options[book_label]
     book_title = get_book_title(book_id, books_df)
+    book_total_pages = get_book_total_pages(book_id, books_df)
+    if book_total_pages > 0:
+        st.caption(f"이 책의 전체 페이지 수는 {book_total_pages:,}쪽입니다. 끝 페이지와 문장 페이지는 이 범위를 넘을 수 없습니다.")
+    else:
+        st.caption("이 책의 전체 페이지 수가 아직 입력되지 않았습니다. 가족 책장에서 전체 페이지 수를 수정할 수 있습니다.")
 
     last_end_page = get_last_end_page(logs_df, member_id, book_id)
     suggested_start = last_end_page + 1 if last_end_page > 0 else 1
@@ -1942,21 +1955,35 @@ def page_today_reading(data: dict) -> None:
 
     if record_method == "시작/끝 페이지로 계산":
         col1, col2, col3 = st.columns(3)
-        start_page = col1.number_input(
-            "시작 페이지",
-            min_value=1,
-            step=1,
-            value=max(1, suggested_start),
-            key=f"today_start_{member_id}_{book_id}",
-        )
+        max_page_arg = book_total_pages if book_total_pages > 0 else None
+        default_start = max(1, suggested_start)
+        if book_total_pages > 0 and default_start > book_total_pages:
+            default_start = book_total_pages
+            st.warning("이미 이 책의 전체 페이지 수 이상으로 기록되어 있습니다. 전체 페이지 수가 맞는지 가족 책장에서 확인해주세요.")
+        start_kwargs = {
+            "label": "시작 페이지",
+            "min_value": 1,
+            "step": 1,
+            "value": default_start,
+            "key": f"today_start_{member_id}_{book_id}",
+        }
+        if max_page_arg is not None:
+            start_kwargs["max_value"] = max_page_arg
+        start_page = col1.number_input(**start_kwargs)
+
         default_end = max(int(start_page), int(start_page) + 9)
-        end_page = col2.number_input(
-            "끝 페이지",
-            min_value=1,
-            step=1,
-            value=default_end,
-            key=f"today_end_{member_id}_{book_id}",
-        )
+        if book_total_pages > 0:
+            default_end = min(default_end, book_total_pages)
+        end_kwargs = {
+            "label": "끝 페이지",
+            "min_value": 1,
+            "step": 1,
+            "value": default_end,
+            "key": f"today_end_{member_id}_{book_id}",
+        }
+        if max_page_arg is not None:
+            end_kwargs["max_value"] = max_page_arg
+        end_page = col2.number_input(**end_kwargs)
         if int(end_page) >= int(start_page):
             pages_read = int(end_page) - int(start_page) + 1
             col3.metric("자동 계산", f"{pages_read}쪽")
@@ -1964,29 +1991,38 @@ def page_today_reading(data: dict) -> None:
             col3.metric("자동 계산", "확인 필요")
             st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
     else:
-        pages_read = st.number_input(
-            "읽은 페이지 수",
-            min_value=1,
-            step=1,
-            value=10,
-            key=f"today_pages_direct_{member_id}_{book_id}",
-        )
+        direct_kwargs = {
+            "label": "읽은 페이지 수",
+            "min_value": 1,
+            "step": 1,
+            "value": min(10, book_total_pages) if book_total_pages > 0 else 10,
+            "key": f"today_pages_direct_{member_id}_{book_id}",
+        }
+        if book_total_pages > 0:
+            direct_kwargs["max_value"] = book_total_pages
+        pages_read = st.number_input(**direct_kwargs)
         col1, col2 = st.columns(2)
-        start_page = col1.number_input(
-            "시작 페이지 선택 입력",
-            min_value=0,
-            step=1,
-            value=0,
-            key=f"today_start_direct_{member_id}_{book_id}",
-        )
-        end_page = col2.number_input(
-            "끝 페이지 선택 입력",
-            min_value=0,
-            step=1,
-            value=0,
-            key=f"today_end_direct_{member_id}_{book_id}",
-        )
-        st.caption("페이지 번호가 없거나 건너뛰어 읽은 경우에는 읽은 페이지 수만 직접 입력해도 됩니다.")
+        optional_max_page_arg = book_total_pages if book_total_pages > 0 else None
+        start_direct_kwargs = {
+            "label": "시작 페이지 선택 입력",
+            "min_value": 0,
+            "step": 1,
+            "value": 0,
+            "key": f"today_start_direct_{member_id}_{book_id}",
+        }
+        end_direct_kwargs = {
+            "label": "끝 페이지 선택 입력",
+            "min_value": 0,
+            "step": 1,
+            "value": 0,
+            "key": f"today_end_direct_{member_id}_{book_id}",
+        }
+        if optional_max_page_arg is not None:
+            start_direct_kwargs["max_value"] = optional_max_page_arg
+            end_direct_kwargs["max_value"] = optional_max_page_arg
+        start_page = col1.number_input(**start_direct_kwargs)
+        end_page = col2.number_input(**end_direct_kwargs)
+        st.caption("페이지 번호가 없거나 건너뛰어 읽은 경우에는 읽은 페이지 수만 직접 입력해도 됩니다. 전체 페이지 수가 입력된 책은 그 범위 안에서만 저장할 수 있습니다.")
 
     memo = st.text_area("메모", placeholder="예: 자기 전에 20분 읽음", key=f"today_memo_{member_id}_{book_id}")
 
@@ -1996,7 +2032,16 @@ def page_today_reading(data: dict) -> None:
     quote_text = ""
     quote_comment = ""
     if add_quote:
-        quote_page = st.number_input("문장 페이지 번호", min_value=0, step=1, value=safe_int(end_page, 0), key=f"today_quote_page_{member_id}_{book_id}")
+        quote_page_kwargs = {
+            "label": "문장 페이지 번호",
+            "min_value": 0,
+            "step": 1,
+            "value": min(safe_int(end_page, 0), book_total_pages) if book_total_pages > 0 else safe_int(end_page, 0),
+            "key": f"today_quote_page_{member_id}_{book_id}",
+        }
+        if book_total_pages > 0:
+            quote_page_kwargs["max_value"] = book_total_pages
+        quote_page = st.number_input(**quote_page_kwargs)
         quote_text = st.text_area("좋았던 문장", key=f"today_quote_text_{member_id}_{book_id}")
         quote_comment = st.text_area("내 생각", key=f"today_quote_comment_{member_id}_{book_id}")
 
@@ -2033,11 +2078,24 @@ def page_today_reading(data: dict) -> None:
         if record_method == "시작/끝 페이지로 계산" and int(end_page) < int(start_page):
             st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
             return
+        if book_total_pages > 0:
+            if safe_int(start_page, 0) > book_total_pages or safe_int(end_page, 0) > book_total_pages:
+                st.error(f"이 책의 전체 페이지 수는 {book_total_pages:,}쪽입니다. 시작/끝 페이지는 전체 페이지 수를 넘을 수 없습니다.")
+                return
+            if safe_int(pages_read, 0) > book_total_pages:
+                st.error(f"이 책의 전체 페이지 수는 {book_total_pages:,}쪽입니다. 읽은 페이지 수는 전체 페이지 수를 넘을 수 없습니다.")
+                return
+        if record_method == "읽은 페이지 수 직접 입력" and safe_int(start_page, 0) and safe_int(end_page, 0) and safe_int(end_page, 0) < safe_int(start_page, 0):
+            st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다. 페이지 번호를 모르면 시작/끝 페이지를 0으로 두고 읽은 페이지 수만 입력해주세요.")
+            return
         if safe_int(pages_read, 0) <= 0:
             st.error("읽은 페이지 수는 1쪽 이상이어야 합니다.")
             return
         if add_quote and not str(quote_text).strip():
             st.error("좋았던 문장을 입력하거나, '좋았던 문장도 남기기' 체크를 해제해주세요.")
+            return
+        if add_quote and book_total_pages > 0 and safe_int(quote_page, 0) > book_total_pages:
+            st.error(f"이 책의 전체 페이지 수는 {book_total_pages:,}쪽입니다. 문장 페이지 번호는 전체 페이지 수를 넘을 수 없습니다.")
             return
         if finished and not str(one_line_review).strip():
             st.error("완독 감상을 저장하려면 한 줄 감상을 입력하거나, '오늘 이 책을 완독했나요?' 체크를 해제해주세요.")
