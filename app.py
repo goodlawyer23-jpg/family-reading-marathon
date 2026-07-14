@@ -11,6 +11,13 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+from storage import (
+    StorageError,
+    StorageWriteDisabledError,
+    get_backend_name,
+    get_storage,
+)
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -72,11 +79,15 @@ CSV_PATHS = {
     "settings": DATA_DIR / "settings.csv",
 }
 
+_TODAY_FOR_DEFAULT = date.today()
+_DEFAULT_MONTH_START = _TODAY_FOR_DEFAULT.replace(day=1)
+_DEFAULT_MONTH_END = (pd.Timestamp(_DEFAULT_MONTH_START) + pd.offsets.MonthEnd(0)).date()
+
 DEFAULT_SETTINGS = {
-    "marathon_id": "2026-07",
-    "marathon_name": "2026년 7월 우리가족 독서마라톤",
-    "start_date": "2026-07-01",
-    "end_date": "2026-07-31",
+    "marathon_id": _DEFAULT_MONTH_START.strftime("%Y-%m"),
+    "marathon_name": f"{_DEFAULT_MONTH_START.year}년 {_DEFAULT_MONTH_START.month}월 우리가족 독서마라톤",
+    "start_date": _DEFAULT_MONTH_START.isoformat(),
+    "end_date": _DEFAULT_MONTH_END.isoformat(),
     "family_target_pages": 2000,
     "unit_name": "페이지",
     "is_active": True,
@@ -104,11 +115,24 @@ def is_admin_password_configured() -> bool:
     return bool(get_admin_password())
 
 
-def is_admin() -> bool:
-    """ADMIN_PASSWORD가 없으면 로컬 개발 편의를 위해 관리자 권한을 허용합니다."""
+def is_authenticated_admin() -> bool:
+    """저장소 종류와 무관한 관리자 인증 상태입니다."""
     if not is_admin_password_configured():
         return True
     return bool(st.session_state.get("is_admin", False))
+
+
+def is_admin() -> bool:
+    """관리자 인증 상태입니다. CSV와 Supabase 모두 동일하게 적용합니다."""
+    return is_authenticated_admin()
+
+
+def can_add_runner() -> bool:
+    return is_authenticated_admin()
+
+
+def can_add_book() -> bool:
+    return is_authenticated_admin()
 
 
 def admin_disabled_help() -> str:
@@ -117,12 +141,18 @@ def admin_disabled_help() -> str:
 
 def render_admin_mode_panel() -> None:
     """사이드바 관리자 모드 로그인 패널."""
-    admin_password = get_admin_password()
     st.markdown("### 🔐 관리자 모드")
+    admin_password = get_admin_password()
+
+    if storage_backend_name() == "supabase":
+        st.info("Supabase 저장소가 연결되어 있습니다. 관리자 모드에서 추가·수정·삭제 기능을 사용할 수 있습니다.")
 
     if not admin_password:
         st.session_state["is_admin"] = True
-        st.warning("ADMIN_PASSWORD가 설정되어 있지 않아 현재는 쓰기 기능이 허용됩니다. 공개 배포 시 Streamlit Secrets에 ADMIN_PASSWORD를 설정해주세요.")
+        if storage_backend_name() == "supabase":
+            st.warning("ADMIN_PASSWORD가 설정되어 있지 않아 쓰기 기능이 허용됩니다. 공개 배포 시 반드시 ADMIN_PASSWORD를 설정해주세요.")
+        else:
+            st.warning("ADMIN_PASSWORD가 설정되어 있지 않아 현재는 쓰기 기능이 허용됩니다. 공개 배포 시 Streamlit Secrets에 ADMIN_PASSWORD를 설정해주세요.")
         return
 
     if st.session_state.get("is_admin", False):
@@ -175,38 +205,41 @@ def ensure_directories() -> None:
     SAMPLE_DIR.mkdir(exist_ok=True)
 
 
+def storage_backend_name() -> str:
+    return get_backend_name()
+
+
+def storage_app_writes_enabled() -> bool:
+    try:
+        return bool(get_storage(DATA_DIR, DEFAULT_SETTINGS).app_writes_enabled)
+    except StorageError:
+        return False
+
+
 def ensure_csv_files() -> None:
+    """CSV 백엔드일 때만 기존 파일 자동 생성을 수행합니다."""
     ensure_directories()
-    for key, path in CSV_PATHS.items():
-        if not path.exists():
-            if key == "settings":
-                pd.DataFrame([DEFAULT_SETTINGS], columns=CSV_COLUMNS[key]).to_csv(path, index=False, encoding="utf-8-sig")
-            else:
-                pd.DataFrame(columns=CSV_COLUMNS[key]).to_csv(path, index=False, encoding="utf-8-sig")
+    if storage_backend_name() == "csv":
+        get_storage(DATA_DIR, DEFAULT_SETTINGS)
 
 
 def read_csv(key: str) -> pd.DataFrame:
-    path = CSV_PATHS[key]
-    if not path.exists():
-        ensure_csv_files()
+    """기존 함수명을 유지하면서 선택된 저장소에서 읽습니다."""
     try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        df = pd.read_csv(path, encoding="utf-8")
-    except pd.errors.EmptyDataError:
-        df = pd.DataFrame(columns=CSV_COLUMNS[key])
-    for col in CSV_COLUMNS[key]:
-        if col not in df.columns:
-            df[col] = ""
-    return df[CSV_COLUMNS[key]]
+        return get_storage(DATA_DIR, DEFAULT_SETTINGS).load_table(key)
+    except StorageError as exc:
+        raise RuntimeError(f"데이터 저장소 읽기 실패 ({key}): {exc}") from exc
 
 
 def write_csv(key: str, df: pd.DataFrame) -> None:
-    for col in CSV_COLUMNS[key]:
-        if col not in df.columns:
-            df[col] = ""
-    df[CSV_COLUMNS[key]].to_csv(CSV_PATHS[key], index=False, encoding="utf-8-sig")
-
+    """CSV는 기존 전체 저장을 유지하고, Supabase에서는 1차 읽기 검증 동안 차단합니다."""
+    storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+    if not storage.app_writes_enabled:
+        raise StorageWriteDisabledError(
+            "현재 Supabase 백엔드는 1차 읽기 검증 모드입니다. "
+            "데이터 추가·수정·삭제는 CSV 백엔드에서만 사용할 수 있습니다."
+        )
+    storage.replace_table(key, df)
 
 def normalize_bool(value) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y", "활성", "active"}
@@ -221,7 +254,9 @@ def make_marathon_id(start_date_value) -> str:
 
 
 def migrate_data_schema() -> None:
-    """기존 단일 마라톤 CSV를 여러 마라톤 구조로 자동 보정합니다."""
+    """CSV 백엔드의 기존 데이터를 자동 보정합니다. Supabase는 SQL 스키마를 사용합니다."""
+    if storage_backend_name() != "csv":
+        return
     ensure_directories()
 
     settings_df = read_csv("settings")
@@ -343,9 +378,29 @@ def set_active_marathon(marathon_id: str) -> None:
     settings_df = read_csv("settings")
     if settings_df.empty:
         return
-    settings_df["is_active"] = settings_df["marathon_id"].astype(str) == str(marathon_id)
-    write_csv("settings", settings_df)
+    marathon_id = str(marathon_id)
+    if storage_backend_name() == "csv":
+        settings_df["is_active"] = settings_df["marathon_id"].astype(str) == marathon_id
+        write_csv("settings", settings_df)
+        return
 
+    storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+    previous_active_ids = settings_df.loc[
+        settings_df["is_active"].apply(normalize_bool), "marathon_id"
+    ].astype(str).tolist()
+    try:
+        for old_id in previous_active_ids:
+            storage.update_rows("settings", {"marathon_id": old_id}, {"is_active": False})
+        updated = storage.update_rows("settings", {"marathon_id": marathon_id}, {"is_active": True})
+        if not updated:
+            raise StorageError("선택한 마라톤을 찾지 못했습니다.")
+    except Exception:
+        for old_id in previous_active_ids:
+            try:
+                storage.update_rows("settings", {"marathon_id": old_id}, {"is_active": True})
+            except Exception:
+                pass
+        raise
 
 def start_new_marathon(marathon_name: str, start_date_value, end_date_value, family_target_pages: int, unit_name: str) -> str:
     settings_df = read_csv("settings")
@@ -356,8 +411,6 @@ def start_new_marathon(marathon_name: str, start_date_value, end_date_value, fam
     while new_id in existing_ids:
         new_id = f"{base_id}-{suffix}"
         suffix += 1
-    if not settings_df.empty:
-        settings_df["is_active"] = False
     new_row = {
         "marathon_id": new_id,
         "marathon_name": str(marathon_name).strip() or f"{new_id} 우리가족 독서마라톤",
@@ -368,10 +421,35 @@ def start_new_marathon(marathon_name: str, start_date_value, end_date_value, fam
         "is_active": True,
         "created_at": now_str(),
     }
-    settings_df = pd.concat([settings_df, pd.DataFrame([new_row])], ignore_index=True)
-    write_csv("settings", settings_df)
-    return new_id
+    if storage_backend_name() == "csv":
+        if not settings_df.empty:
+            settings_df["is_active"] = False
+        settings_df = pd.concat([settings_df, pd.DataFrame([new_row])], ignore_index=True)
+        write_csv("settings", settings_df)
+        return new_id
 
+    storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+    previous_active_ids = settings_df.loc[
+        settings_df["is_active"].apply(normalize_bool), "marathon_id"
+    ].astype(str).tolist() if not settings_df.empty else []
+    try:
+        for old_id in previous_active_ids:
+            storage.update_rows("settings", {"marathon_id": old_id}, {"is_active": False})
+        inserted = storage.insert_row("settings", new_row)
+        if not inserted:
+            raise StorageError("새 마라톤 행이 반환되지 않았습니다.")
+        return new_id
+    except Exception:
+        try:
+            storage.delete_rows("settings", {"marathon_id": new_id})
+        except Exception:
+            pass
+        for old_id in previous_active_ids:
+            try:
+                storage.update_rows("settings", {"marathon_id": old_id}, {"is_active": True})
+            except Exception:
+                pass
+        raise
 
 def get_next_marathon_defaults(settings_df: pd.DataFrame) -> dict:
     active = get_active_marathon(settings_df)
@@ -393,14 +471,13 @@ def get_next_marathon_defaults(settings_df: pd.DataFrame) -> dict:
 
 
 def delete_marathon_and_related_data(marathon_id: str) -> dict:
-    """선택한 독서마라톤과 해당 마라톤에 속한 책장/기록을 삭제합니다. 러너는 삭제하지 않습니다."""
+    """마라톤을 삭제합니다. Supabase에서는 FK ON DELETE CASCADE를 사용합니다."""
     marathon_id = str(marathon_id).strip()
     result = {"settings": 0, "books": 0, "logs": 0, "quotes": 0, "reviews": 0, "new_active_id": ""}
     settings_df = read_csv("settings")
     if settings_df.empty or "marathon_id" not in settings_df.columns:
         result["error"] = "삭제할 독서마라톤을 찾지 못했습니다."
         return result
-
     target_mask = settings_df["marathon_id"].astype(str) == marathon_id
     result["settings"] = int(target_mask.sum())
     if result["settings"] == 0:
@@ -410,32 +487,49 @@ def delete_marathon_and_related_data(marathon_id: str) -> dict:
         result["error"] = "독서마라톤은 최소 1개가 필요합니다. 마지막 마라톤은 삭제할 수 없습니다."
         return result
 
-    was_active = bool(settings_df.loc[target_mask, "is_active"].apply(normalize_bool).any())
-    settings_df = settings_df.loc[~target_mask].copy()
-    if was_active:
-        settings_df["is_active"] = False
-        try:
-            order = pd.to_datetime(settings_df["start_date"], errors="coerce")
-            new_active_idx = order.sort_values(ascending=False).index[0]
-        except Exception:
-            new_active_idx = settings_df.index[-1]
-        settings_df.loc[new_active_idx, "is_active"] = True
-        result["new_active_id"] = str(settings_df.loc[new_active_idx, "marathon_id"])
-    elif not settings_df["is_active"].apply(normalize_bool).any():
-        settings_df.loc[settings_df.index[0], "is_active"] = True
-        result["new_active_id"] = str(settings_df.loc[settings_df.index[0], "marathon_id"])
-    write_csv("settings", settings_df)
-
     for key, result_key in [("books", "books"), ("reading_logs", "logs"), ("quotes", "quotes"), ("reviews", "reviews")]:
         df = read_csv(key)
-        if df.empty or "marathon_id" not in df.columns:
-            continue
-        mask = df["marathon_id"].astype(str) == marathon_id
-        result[result_key] = int(mask.sum())
-        if mask.any():
-            write_csv(key, df.loc[~mask].copy())
-    return result
+        if not df.empty and "marathon_id" in df.columns:
+            result[result_key] = int((df["marathon_id"].astype(str) == marathon_id).sum())
 
+    was_active = bool(settings_df.loc[target_mask, "is_active"].apply(normalize_bool).any())
+    remaining = settings_df.loc[~target_mask].copy()
+    try:
+        order = pd.to_datetime(remaining["start_date"], errors="coerce")
+        replacement_id = str(remaining.loc[order.sort_values(ascending=False).index[0], "marathon_id"])
+    except Exception:
+        replacement_id = str(remaining.iloc[-1]["marathon_id"])
+
+    if storage_backend_name() == "csv":
+        if was_active:
+            remaining["is_active"] = remaining["marathon_id"].astype(str) == replacement_id
+            result["new_active_id"] = replacement_id
+        write_csv("settings", remaining)
+        for key in ["books", "reading_logs", "quotes", "reviews"]:
+            df = read_csv(key)
+            if not df.empty and "marathon_id" in df.columns:
+                write_csv(key, df[df["marathon_id"].astype(str) != marathon_id].copy())
+        return result
+
+    storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+    try:
+        if was_active:
+            storage.update_rows("settings", {"marathon_id": marathon_id}, {"is_active": False})
+            storage.update_rows("settings", {"marathon_id": replacement_id}, {"is_active": True})
+            result["new_active_id"] = replacement_id
+        deleted = storage.delete_rows("settings", {"marathon_id": marathon_id})
+        if not deleted:
+            raise StorageError("삭제할 마라톤 행을 찾지 못했습니다.")
+        return result
+    except Exception as exc:
+        if was_active:
+            try:
+                storage.update_rows("settings", {"marathon_id": replacement_id}, {"is_active": False})
+                storage.update_rows("settings", {"marathon_id": marathon_id}, {"is_active": True})
+            except Exception:
+                pass
+        result["error"] = f"마라톤 삭제 실패: {exc}"
+        return result
 
 def load_all_data() -> dict:
     ensure_csv_files()
@@ -443,66 +537,50 @@ def load_all_data() -> dict:
 
 
 def delete_runner_and_related_data(member_id: str) -> dict:
-    """러너와 해당 러너에게 연결된 책장/기록을 함께 삭제합니다."""
+    """러너 및 관련 데이터를 순서대로 정리합니다."""
     member_id = str(member_id)
     result = {"members": 0, "books": 0, "logs": 0, "quotes": 0, "reviews": 0}
-
     members_df = read_csv("family_members")
-    if members_df.empty or "member_id" not in members_df.columns:
+    if members_df.empty:
         return result
-
     member_mask = members_df["member_id"].astype(str) == member_id
     result["members"] = int(member_mask.sum())
-    if result["members"] == 0:
+    if not result["members"]:
         return result
 
     books_df = read_csv("books")
-    if not books_df.empty and "reader_member_id" in books_df.columns:
-        runner_book_ids = books_df.loc[books_df["reader_member_id"].astype(str) == member_id, "book_id"].astype(str).tolist()
-    else:
-        runner_book_ids = []
+    runner_book_ids = books_df.loc[
+        books_df["reader_member_id"].astype(str) == member_id, "book_id"
+    ].astype(str).tolist() if not books_df.empty else []
+    logs_df, quotes_df, reviews_df = read_csv("reading_logs"), read_csv("quotes"), read_csv("reviews")
+    result["books"] = int((books_df["reader_member_id"].astype(str) == member_id).sum()) if not books_df.empty else 0
+    result["logs"] = int(((logs_df["member_id"].astype(str) == member_id) | logs_df["book_id"].astype(str).isin(runner_book_ids)).sum()) if not logs_df.empty else 0
+    result["quotes"] = int(((quotes_df["member_id"].astype(str) == member_id) | quotes_df["book_id"].astype(str).isin(runner_book_ids)).sum()) if not quotes_df.empty else 0
+    result["reviews"] = int(((reviews_df["member_id"].astype(str) == member_id) | reviews_df["book_id"].astype(str).isin(runner_book_ids)).sum()) if not reviews_df.empty else 0
 
-    logs_df = read_csv("reading_logs")
-    quotes_df = read_csv("quotes")
-    reviews_df = read_csv("reviews")
+    if storage_backend_name() == "csv":
+        write_csv("reading_logs", logs_df[~((logs_df["member_id"].astype(str) == member_id) | logs_df["book_id"].astype(str).isin(runner_book_ids))].copy())
+        write_csv("quotes", quotes_df[~((quotes_df["member_id"].astype(str) == member_id) | quotes_df["book_id"].astype(str).isin(runner_book_ids))].copy())
+        write_csv("reviews", reviews_df[~((reviews_df["member_id"].astype(str) == member_id) | reviews_df["book_id"].astype(str).isin(runner_book_ids))].copy())
+        write_csv("books", books_df[books_df["reader_member_id"].astype(str) != member_id].copy())
+        write_csv("family_members", members_df[~member_mask].copy())
+        return result
 
-    # 책장은 reader_member_id 기준으로 삭제합니다.
-    if not books_df.empty:
-        book_mask = books_df["reader_member_id"].astype(str) == member_id
-        result["books"] = int(book_mask.sum())
-        books_df = books_df.loc[~book_mask].copy()
-
-    # 기록은 member_id 기준으로 삭제하되, 혹시 남아 있는 책 연결 기록도 함께 정리합니다.
-    if not logs_df.empty:
-        log_mask = logs_df["member_id"].astype(str) == member_id
-        if runner_book_ids and "book_id" in logs_df.columns:
-            log_mask = log_mask | logs_df["book_id"].astype(str).isin(runner_book_ids)
-        result["logs"] = int(log_mask.sum())
-        logs_df = logs_df.loc[~log_mask].copy()
-
-    if not quotes_df.empty:
-        quote_mask = quotes_df["member_id"].astype(str) == member_id
-        if runner_book_ids and "book_id" in quotes_df.columns:
-            quote_mask = quote_mask | quotes_df["book_id"].astype(str).isin(runner_book_ids)
-        result["quotes"] = int(quote_mask.sum())
-        quotes_df = quotes_df.loc[~quote_mask].copy()
-
-    if not reviews_df.empty:
-        review_mask = reviews_df["member_id"].astype(str) == member_id
-        if runner_book_ids and "book_id" in reviews_df.columns:
-            review_mask = review_mask | reviews_df["book_id"].astype(str).isin(runner_book_ids)
-        result["reviews"] = int(review_mask.sum())
-        reviews_df = reviews_df.loc[~review_mask].copy()
-
-    members_df = members_df.loc[~member_mask].copy()
-
-    write_csv("family_members", members_df)
-    write_csv("books", books_df)
-    write_csv("reading_logs", logs_df)
-    write_csv("quotes", quotes_df)
-    write_csv("reviews", reviews_df)
-    return result
-
+    storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+    try:
+        # member_id 기준 삭제 후, 혹시 다른 member_id로 남은 책 연결 기록도 book_id 기준 정리합니다.
+        for table in ["reading_logs", "quotes", "reviews"]:
+            storage.delete_rows(table, {"member_id": member_id})
+            for book_id in runner_book_ids:
+                storage.delete_rows(table, {"book_id": book_id})
+        storage.delete_rows("books", {"reader_member_id": member_id})
+        deleted = storage.delete_rows("family_members", {"member_id": member_id})
+        if not deleted:
+            raise StorageError("삭제할 러너를 찾지 못했습니다.")
+        return result
+    except Exception as exc:
+        result["error"] = f"러너 삭제 중 오류가 발생했습니다: {exc}"
+        return result
 
 def safe_int(value, default: int = 0) -> int:
     try:
@@ -520,6 +598,26 @@ def safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def normalize_rating(value, default: float = 0.0) -> float:
+    """기존 정수·실수 별점을 0.5점 단위 0~5 범위로 정규화합니다."""
+    rating = safe_float(value, default)
+    return max(0.0, min(5.0, round(rating * 2) / 2))
+
+
+def format_rating(value, default: float = 0.0) -> str:
+    return f"{normalize_rating(value, default):.1f}"
+
+
+def format_moon_rating(value, include_score: bool = True) -> str:
+    """🌕=1점, 🌗=0.5점, 🌑=빈 점수로 5칸 평점을 만듭니다."""
+    rating = normalize_rating(value, 0.0)
+    full = int(rating)
+    half = 1 if rating - full >= 0.5 else 0
+    empty = max(0, 5 - full - half)
+    moons = "🌕" * full + "🌗" * half + "🌑" * empty
+    return f"{moons} {rating:.1f} / 5.0" if include_score else moons
 
 
 def get_settings(settings_df: pd.DataFrame) -> dict:
@@ -725,7 +823,16 @@ def create_sample_data() -> None:
         {"review_id": "review_003", "marathon_id": sample_marathon_id, "member_id": "member_dad", "book_id": "book_002", "rating": 4, "one_line_review": "사람 냄새 나는 따뜻한 소설.", "full_review": "짧게 읽기 좋아서 독서마라톤 첫 책으로 좋다.", "finished_date": "", "created_at": now_str()},
     ], columns=CSV_COLUMNS["reviews"])
 
-    settings = pd.DataFrame([{**DEFAULT_SETTINGS, "marathon_id": sample_marathon_id, "is_active": True, "created_at": now_str()}], columns=CSV_COLUMNS["settings"])
+    settings = pd.DataFrame([{
+        "marathon_id": sample_marathon_id,
+        "marathon_name": "2026년 7월 우리가족 독서마라톤",
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-31",
+        "family_target_pages": 2000,
+        "unit_name": "페이지",
+        "is_active": True,
+        "created_at": now_str(),
+    }], columns=CSV_COLUMNS["settings"])
 
     write_csv("family_members", members)
     write_csv("books", books)
@@ -1067,21 +1174,30 @@ def build_page_lookup_message(total_pages: int, lookup_result: dict | None) -> t
 
 
 def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bool, str, str]:
-    """책장에 책을 추가합니다. 같은 마라톤 안에서 같은 책+같은 러너 조합은 중복 등록하지 않습니다."""
+    """책장에 책을 추가합니다.
+
+    CSV에서는 기존 전체 DataFrame 저장 방식을 유지합니다.
+    Supabase에서는 books.insert_row를 사용하며, 기존 러너 미지정 행 연결이 필요한
+    경우에만 update_rows를 사용합니다.
+    """
     books_df = read_csv("books")
     active_marathon_id = get_active_marathon_id(read_csv("settings"))
     title = clean_html(book_data.get("title", "")).strip()
     reader_member_id = str(reader_member_id or "").strip()
-    isbn = str(book_data.get("isbn", "") or "").strip()
     total_pages = safe_int(book_data.get("total_pages"), 0)
     lookup_result = {"status": "not_called", "message": ""}
 
-    # 안정적인 책 등록 UX를 위해 국립중앙도서관 API는 책장 추가 시 자동 호출하지 않습니다.
-    # 네이버/샘플/직접등록 값에 total_pages가 있으면 그대로 저장하고, 없으면 0으로 저장합니다.
+    if not reader_member_id:
+        return False, "책을 읽을 러너를 선택해주세요.", ""
+
+    # 안정적인 책 등록 UX를 위해 국립중앙도서관 API는 자동 호출하지 않습니다.
     if total_pages <= 0:
         lookup_result = {
             "status": "auto_off",
-            "message": "국립중앙도서관 페이지 수 자동 조회는 기본값 OFF입니다. 필요하면 설정 화면의 수동 테스트를 사용하세요.",
+            "message": (
+                "국립중앙도서관 페이지 수 자동 조회는 기본값 OFF입니다. "
+                "전체 페이지 수는 책장 추가 전 직접 입력하거나 가족 책장에서 수정할 수 있습니다."
+            ),
         }
 
     page_message, detail_message = build_page_lookup_message(total_pages, lookup_result)
@@ -1089,42 +1205,88 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
     scoped_books_df = filter_by_marathon(books_df, active_marathon_id)
     duplicate_book_mask = same_book_mask(scoped_books_df, book_data)
     if len(duplicate_book_mask) == len(scoped_books_df) and duplicate_book_mask.any():
-        same_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == reader_member_id
+        same_reader_mask = (
+            scoped_books_df.get(
+                "reader_member_id",
+                pd.Series([""] * len(scoped_books_df), index=scoped_books_df.index),
+            )
+            .astype(str)
+            .str.strip()
+            == reader_member_id
+        )
         same_book_same_reader = scoped_books_df[duplicate_book_mask & same_reader_mask]
         if not same_book_same_reader.empty:
             return False, f"이미 이 러너의 책장에 《{title or '이 책'}》이 있습니다.", "중복 책장 추가 방지"
 
-        no_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == ""
+        no_reader_mask = (
+            scoped_books_df.get(
+                "reader_member_id",
+                pd.Series([""] * len(scoped_books_df), index=scoped_books_df.index),
+            )
+            .astype(str)
+            .str.strip()
+            == ""
+        )
         no_reader_rows = scoped_books_df[duplicate_book_mask & no_reader_mask]
-        if reader_member_id and not no_reader_rows.empty:
-            idx = no_reader_rows.index[0]
-            books_df.loc[idx, "reader_member_id"] = reader_member_id
-            if safe_int(books_df.loc[idx, "total_pages"], 0) <= 0 and total_pages > 0:
-                books_df.loc[idx, "total_pages"] = total_pages
-            write_csv("books", books_df)
-            # 저장 직후 다음 렌더링에서 반드시 최신 CSV를 읽도록 표시합니다.
-            st.session_state["books_csv_updated_at"] = now_str()
-            return True, f"기존 책장 항목에 읽는 러너를 연결했습니다. {page_message}", detail_message
+        if not no_reader_rows.empty:
+            existing_row = no_reader_rows.iloc[0]
+            existing_book_id = str(existing_row.get("book_id", "")).strip()
+            update_values = {"reader_member_id": reader_member_id}
+            if safe_int(existing_row.get("total_pages", 0), 0) <= 0 and total_pages > 0:
+                update_values["total_pages"] = total_pages
+
+            try:
+                storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+                if storage_backend_name() == "supabase":
+                    storage.update_rows(
+                        "books",
+                        {"book_id": existing_book_id, "marathon_id": active_marathon_id},
+                        update_values,
+                    )
+                else:
+                    mask = books_df["book_id"].astype(str) == existing_book_id
+                    books_df.loc[mask, "reader_member_id"] = reader_member_id
+                    if "total_pages" in update_values:
+                        books_df.loc[mask, "total_pages"] = total_pages
+                    write_csv("books", books_df)
+                st.session_state["books_csv_updated_at"] = now_str()
+                return True, f"기존 책장 항목에 읽는 러너를 연결했습니다. {page_message}", detail_message
+            except (StorageError, StorageWriteDisabledError, RuntimeError) as exc:
+                return False, f"책장 저장에 실패했습니다: {exc}", ""
+            except Exception as exc:
+                return False, f"책장 저장 중 오류가 발생했습니다: {exc.__class__.__name__}", ""
 
     row = {col: book_data.get(col, "") for col in CSV_COLUMNS["books"]}
     row["book_id"] = make_id("book")
     row["marathon_id"] = active_marathon_id
-    row["reader_member_id"] = reader_member_id or row.get("reader_member_id", "")
+    row["reader_member_id"] = reader_member_id
     row["title"] = title
     row["author"] = clean_html(row.get("author", ""))
     row["publisher"] = clean_html(row.get("publisher", ""))
     row["description"] = clean_html(row.get("description", ""))
-    row["pubdate"] = normalize_pubdate(row.get("pubdate", ""))
+    row["pubdate"] = normalize_pubdate(row.get("pubdate", "")) or None
     row["image_url"] = row.get("image_url") or PLACEHOLDER_COVER
+    row["isbn"] = str(row.get("isbn", "") or "").strip()
     row["total_pages"] = total_pages
     row["source_api"] = row.get("source_api") or "manual"
     row["created_at"] = now_str()
-    books_df = pd.concat([books_df, pd.DataFrame([row])], ignore_index=True)
-    write_csv("books", books_df)
-    # 저장 직후 다음 렌더링에서 반드시 최신 CSV를 읽도록 표시합니다.
-    st.session_state["books_csv_updated_at"] = now_str()
-    return True, page_message, detail_message
 
+    try:
+        storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+        if storage_backend_name() == "supabase":
+            inserted = storage.insert_row("books", row)
+            if not inserted:
+                raise StorageError("Supabase가 추가된 책장 행을 반환하지 않았습니다.")
+        else:
+            books_df = pd.concat([books_df, pd.DataFrame([row])], ignore_index=True)
+            write_csv("books", books_df)
+
+        st.session_state["books_csv_updated_at"] = now_str()
+        return True, page_message, detail_message
+    except (StorageError, StorageWriteDisabledError, RuntimeError) as exc:
+        return False, f"책장 저장에 실패했습니다: {exc}", ""
+    except Exception as exc:
+        return False, f"책장 저장 중 오류가 발생했습니다: {exc.__class__.__name__}", ""
 
 def calculate_summary(data: dict) -> dict:
     books_df = data["books"]
@@ -1358,66 +1520,63 @@ def count_book_related_records(book_id: str, marathon_id: str | None = None) -> 
 
 
 def remove_book_from_library(book_id: str, marathon_id: str | None = None) -> tuple[bool, str]:
-    """기록이 없는 책장 항목만 제거합니다."""
-    book_id = str(book_id).strip()
-    marathon_id = str(marathon_id or "").strip()
-    counts = count_book_related_records(book_id, marathon_id)
-    if counts["total"] > 0:
+    book_id, marathon_id = str(book_id).strip(), str(marathon_id or "").strip()
+    if count_book_related_records(book_id, marathon_id)["total"] > 0:
         return False, "이 책에는 독서 기록이 있어 바로 제거할 수 없습니다. 먼저 기록 모아보기에서 관련 기록을 삭제해주세요."
-
-    books_df = read_csv("books")
-    if books_df.empty or "book_id" not in books_df.columns:
-        return False, "제거할 책을 찾지 못했습니다."
-    mask = books_df["book_id"].astype(str).str.strip() == book_id
-    if marathon_id and "marathon_id" in books_df.columns:
-        mask = mask & (books_df["marathon_id"].astype(str).str.strip() == marathon_id)
-    if not mask.any():
-        return False, "제거할 책을 찾지 못했습니다."
-    books_df = books_df.loc[~mask].copy()
-    write_csv("books", books_df)
-    st.session_state["books_csv_updated_at"] = now_str()
-    return True, "책장에서 제거했습니다."
-
+    filters = {"book_id": book_id}
+    if marathon_id:
+        filters["marathon_id"] = marathon_id
+    try:
+        if storage_backend_name() == "supabase":
+            deleted = get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows("books", filters)
+            if not deleted:
+                return False, "제거할 책을 찾지 못했습니다."
+        else:
+            books_df = read_csv("books")
+            mask = books_df["book_id"].astype(str) == book_id
+            if marathon_id:
+                mask &= books_df["marathon_id"].astype(str) == marathon_id
+            if not mask.any():
+                return False, "제거할 책을 찾지 못했습니다."
+            write_csv("books", books_df.loc[~mask].copy())
+        return True, "책장에서 제거했습니다."
+    except Exception as exc:
+        return False, f"책장 제거 실패: {exc}"
 
 def update_book_reader(book_id: str, new_reader_member_id: str, marathon_id: str | None = None) -> tuple[bool, str]:
-    """기록이 없는 책장 항목의 읽는 러너를 변경합니다."""
     book_id = str(book_id).strip()
     new_reader_member_id = str(new_reader_member_id or "").strip()
     marathon_id = str(marathon_id or "").strip()
     if not new_reader_member_id:
         return False, "변경할 러너를 선택해주세요."
-
-    counts = count_book_related_records(book_id, marathon_id)
-    if counts["total"] > 0:
+    if count_book_related_records(book_id, marathon_id)["total"] > 0:
         return False, "이미 독서 기록이 있는 책은 러너를 변경할 수 없습니다."
-
     books_df = read_csv("books")
-    if books_df.empty or "book_id" not in books_df.columns:
-        return False, "변경할 책을 찾지 못했습니다."
-    current_mask = books_df["book_id"].astype(str).str.strip() == book_id
-    if marathon_id and "marathon_id" in books_df.columns:
-        current_mask = current_mask & (books_df["marathon_id"].astype(str).str.strip() == marathon_id)
+    current_mask = books_df["book_id"].astype(str) == book_id
+    if marathon_id:
+        current_mask &= books_df["marathon_id"].astype(str) == marathon_id
     if not current_mask.any():
         return False, "변경할 책을 찾지 못했습니다."
-
     current_row = books_df.loc[current_mask].iloc[0].to_dict()
-    current_reader_id = str(current_row.get("reader_member_id", "") or "").strip()
-    if current_reader_id == new_reader_member_id:
+    if str(current_row.get("reader_member_id", "")) == new_reader_member_id:
         return False, "이미 선택한 러너의 책장에 등록되어 있습니다."
-
-    scoped_books_df = filter_by_marathon(books_df, marathon_id) if marathon_id else books_df.copy()
-    duplicate_mask = same_book_mask(scoped_books_df, current_row)
-    if len(duplicate_mask) == len(scoped_books_df) and duplicate_mask.any():
-        same_reader_mask = scoped_books_df.get("reader_member_id", pd.Series([""] * len(scoped_books_df))).astype(str).str.strip() == new_reader_member_id
-        same_book_same_reader = scoped_books_df[duplicate_mask & same_reader_mask & (scoped_books_df["book_id"].astype(str).str.strip() != book_id)]
-        if not same_book_same_reader.empty:
-            return False, "변경하려는 러너의 책장에 이미 같은 책이 있습니다."
-
-    books_df.loc[current_mask, "reader_member_id"] = new_reader_member_id
-    write_csv("books", books_df)
-    st.session_state["books_csv_updated_at"] = now_str()
-    return True, "읽는 러너를 변경했습니다."
-
+    scoped = filter_by_marathon(books_df, marathon_id) if marathon_id else books_df
+    duplicate_mask = same_book_mask(scoped, current_row)
+    same_reader = scoped["reader_member_id"].astype(str) == new_reader_member_id
+    if not scoped[duplicate_mask & same_reader & (scoped["book_id"].astype(str) != book_id)].empty:
+        return False, "변경하려는 러너의 책장에 이미 같은 책이 있습니다."
+    try:
+        if storage_backend_name() == "supabase":
+            filters = {"book_id": book_id}
+            if marathon_id: filters["marathon_id"] = marathon_id
+            updated = get_storage(DATA_DIR, DEFAULT_SETTINGS).update_rows("books", filters, {"reader_member_id": new_reader_member_id})
+            if not updated: return False, "변경할 책을 찾지 못했습니다."
+        else:
+            books_df.loc[current_mask, "reader_member_id"] = new_reader_member_id
+            write_csv("books", books_df)
+        return True, "읽는 러너를 변경했습니다."
+    except Exception as exc:
+        return False, f"러너 변경 실패: {exc}"
 
 def render_metric_cards(summary: dict) -> None:
     settings = summary["settings"]
@@ -1443,6 +1602,18 @@ def render_metric_cards(summary: dict) -> None:
     st.progress(min(summary["progress"] / 100, 1.0), text=f"가족 독서마라톤 진행률 {summary['progress']:.1f}%")
 
 
+def render_empty_start_guide() -> None:
+    """빈 데이터 상태에서 실제 사용 시작 흐름을 안내합니다."""
+    st.markdown("### 🌱 처음 시작하기")
+    st.info(
+        "아직 기록이 없는 새 독서마라톤입니다. 아래 순서로 시작해보세요.\n\n"
+        "1. **설정 / 러너 관리**에서 함께 달릴 러너를 등록합니다.\n"
+        "2. 현재 마라톤 이름과 목표 페이지를 확인합니다.\n"
+        "3. **책 검색 / 책 등록**에서 읽을 책을 러너 책장에 추가합니다.\n"
+        "4. **오늘의 독서 기록**에서 읽은 페이지와 문장을 남깁니다."
+    )
+
+
 def page_dashboard(data: dict) -> None:
     st.title("🏃‍➡️ 우리가족 독서마라톤")
     st.caption("책을 읽은 만큼 가족 마라톤 트랙이 앞으로 나아갑니다.")
@@ -1463,7 +1634,7 @@ def page_dashboard(data: dict) -> None:
 
 
     if member_stats_df.empty:
-        st.warning("아직 러너가 없습니다. 샘플 데이터를 생성하거나 러너를 추가해주세요.")
+        render_empty_start_guide()
     else:
         render_family_contribution_cards(member_stats_df)
         render_runner_cards(member_stats_df, scoped_data["reviews"], scoped_data["quotes"])
@@ -1498,10 +1669,12 @@ def page_book_search(data: dict) -> None:
     st.title("🔎 책 검색 / 책 등록")
     render_read_only_notice("책 검색 / 책 등록")
     st.caption(".env 또는 Streamlit Secrets에 네이버 API 키가 있으면 네이버 책 검색을 먼저 사용하고, 실패하면 샘플 검색으로 자동 전환합니다.")
+    if storage_backend_name() == "supabase":
+        st.caption("Supabase 쓰기 전환 2단계: 관리자 모드에서 네이버 검색 결과 또는 직접 등록 책을 현재 마라톤 책장에 추가할 수 있습니다.")
 
     members_df = data["family_members"]
     if members_df.empty:
-        st.warning("책을 책장에 추가하려면 함께 달릴 러너가 필요합니다. 먼저 샘플 데이터를 생성하거나 러너를 추가해주세요.")
+        st.warning("책을 책장에 추가하려면 함께 달릴 러너가 필요합니다. 먼저 설정 / 러너 관리에서 러너를 등록해주세요.")
         return
 
     m_options = member_options(members_df)
@@ -1591,7 +1764,7 @@ def page_book_search(data: dict) -> None:
             st.caption(st.session_state["book_search_message"])
 
         if not results:
-            st.write("검색어를 입력하고 검색해주세요. 샘플 데이터가 없으면 홈에서 샘플 데이터 생성 버튼을 먼저 눌러주세요.")
+            st.write("검색어를 입력하고 검색해주세요. 검색 결과가 없거나 API 호출이 실패하면 직접 등록 탭에서 책을 등록할 수 있습니다.")
         else:
             st.markdown('<div id="book-search-results-top"></div>', unsafe_allow_html=True)
             st.markdown("#### 3단계. 원하는 책을 선택해 책장에 추가하세요")
@@ -1644,7 +1817,7 @@ def page_book_search(data: dict) -> None:
                                 st.write(description)
                         else:
                             st.caption("책 소개 없음")
-                        if st.button(f"{selected_reader_label}의 책장에 추가", key=f"add_search_{global_idx}_{selected_reader_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
+                        if st.button(f"{selected_reader_label}의 책장에 추가", key=f"add_search_{global_idx}_{selected_reader_id}", disabled=not can_add_book(), help=None if can_add_book() else "관리자 모드에서만 책을 추가할 수 있습니다."):
                             book_to_add = dict(book)
                             book_to_add.update({
                                 "title": title,
@@ -1686,7 +1859,11 @@ def page_book_search(data: dict) -> None:
             description = st.text_area("책 소개")
             pubdate = st.text_input("출간일", placeholder="YYYY-MM-DD 또는 YYYYMMDD")
             total_pages = st.number_input("전체 페이지 수", min_value=0, step=1, value=100)
-            submitted = st.form_submit_button("직접 등록", disabled=not is_admin())
+            submitted = st.form_submit_button(
+                "직접 등록",
+                disabled=not can_add_book(),
+                help=None if can_add_book() else "관리자 모드에서만 책을 추가할 수 있습니다.",
+            )
         if submitted:
             if not title.strip():
                 st.error("제목은 필수입니다.")
@@ -1791,10 +1968,22 @@ def page_library(data: dict) -> None:
                             if "marathon_id" in latest_books_df.columns:
                                 mask = mask & (latest_books_df["marathon_id"].astype(str) == str(selected_marathon_id))
                             if mask.any():
-                                latest_books_df.loc[mask, "total_pages"] = safe_int(edited_total_pages, 0)
-                                write_csv("books", latest_books_df)
-                                st.session_state["library_manage_feedback"] = ("success", "전체 페이지 수를 저장했습니다. 진행률을 다시 계산합니다.")
-                                st.rerun()
+                                try:
+                                    if storage_backend_name() == "supabase":
+                                        updated = get_storage(DATA_DIR, DEFAULT_SETTINGS).update_rows(
+                                            "books",
+                                            {"book_id": str(book["book_id"]), "marathon_id": str(selected_marathon_id)},
+                                            {"total_pages": safe_int(edited_total_pages, 0)},
+                                        )
+                                        if not updated:
+                                            raise StorageError("수정할 책을 찾지 못했습니다.")
+                                    else:
+                                        latest_books_df.loc[mask, "total_pages"] = safe_int(edited_total_pages, 0)
+                                        write_csv("books", latest_books_df)
+                                    st.session_state["library_manage_feedback"] = ("success", "전체 페이지 수를 저장했습니다. 진행률을 다시 계산합니다.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.warning(f"전체 페이지 수 저장 실패: {exc}")
                             else:
                                 st.warning("수정할 책을 찾지 못했습니다.")
 
@@ -1890,10 +2079,10 @@ def page_today_reading(data: dict) -> None:
     reviews_df = filter_by_marathon(read_csv("reviews"), active_mid)
 
     if members_df.empty:
-        st.warning("러너가 필요합니다. 먼저 샘플 데이터를 생성하거나 러너를 추가해주세요.")
+        st.warning("러너가 필요합니다. 먼저 설정 / 러너 관리에서 러너를 등록해주세요.")
         return
     if books_df.empty:
-        st.warning("등록된 책이 없습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
+        st.warning("현재 진행 중인 마라톤의 책장이 비어 있습니다. 먼저 책 검색 / 책 등록 화면에서 책을 추가해주세요.")
         return
 
     st.markdown("### 1단계. 누가 읽었나요?")
@@ -2058,26 +2247,19 @@ def page_today_reading(data: dict) -> None:
 
     st.markdown("### 5단계. 오늘 이 책을 완독했나요?")
     finished = st.checkbox("오늘 이 책을 완독했나요?", key=f"today_finished_{member_id}_{book_id}")
-    rating = 5
+    rating = 5.0
     one_line_review = ""
     full_review = ""
     finished_date_value = reading_date
-    rating_options = {
-        "⭐": 1,
-        "⭐⭐": 2,
-        "⭐⭐⭐": 3,
-        "⭐⭐⭐⭐": 4,
-        "⭐⭐⭐⭐⭐": 5,
-    }
+    rating_options = [i / 2 for i in range(1, 11)]
     if finished:
-        rating_label = st.radio(
-            "별점",
-            list(rating_options.keys()),
-            index=4,
-            horizontal=True,
+        rating = st.select_slider(
+            "달 평점",
+            options=rating_options,
+            value=5.0,
+            format_func=lambda x: f"{format_moon_rating(x, include_score=False)} {float(x):.1f}점",
             key=f"today_rating_stars_{member_id}_{book_id}",
         )
-        rating = rating_options[rating_label]
         one_line_review = st.text_input("한 줄 감상", placeholder="이 책을 다 읽고 남기고 싶은 한 문장", key=f"today_one_line_{member_id}_{book_id}")
         full_review = st.text_area("자세한 감상", placeholder="선택 입력", key=f"today_full_review_{member_id}_{book_id}")
         finished_date_value = st.date_input("완독일", value=reading_date, key=f"today_finished_date_{member_id}_{book_id}")
@@ -2127,44 +2309,62 @@ def page_today_reading(data: dict) -> None:
             "memo": memo,
             "created_at": now_str(),
         }
-        original_logs_df = read_csv("reading_logs")
-        original_logs_df = pd.concat([original_logs_df, pd.DataFrame([log_row])], ignore_index=True)
-        write_csv("reading_logs", original_logs_df)
-
         saved_quote = False
+        saved_review = False
+        quote_row = None
+        review_row = None
         if add_quote:
             quote_row = {
-                "quote_id": make_id("quote"),
-                "marathon_id": active_mid,
-                "member_id": member_id,
-                "book_id": book_id,
-                "page_number": safe_int(quote_page, 0),
-                "quote_text": str(quote_text).strip(),
-                "comment": quote_comment,
-                "created_at": now_str(),
+                "quote_id": make_id("quote"), "marathon_id": active_mid, "member_id": member_id,
+                "book_id": book_id, "page_number": safe_int(quote_page, 0),
+                "quote_text": str(quote_text).strip(), "comment": quote_comment, "created_at": now_str(),
             }
-            original_quotes_df = read_csv("quotes")
-            original_quotes_df = pd.concat([original_quotes_df, pd.DataFrame([quote_row])], ignore_index=True)
-            write_csv("quotes", original_quotes_df)
-            saved_quote = True
-
-        saved_review = False
         if finished:
             review_row = {
-                "review_id": make_id("review"),
-                "marathon_id": active_mid,
-                "member_id": member_id,
-                "book_id": book_id,
-                "rating": safe_int(rating, 5),
-                "one_line_review": str(one_line_review).strip(),
-                "full_review": full_review,
-                "finished_date": finished_date_value.isoformat(),
-                "created_at": now_str(),
+                "review_id": make_id("review"), "marathon_id": active_mid, "member_id": member_id,
+                "book_id": book_id, "rating": safe_float(rating, 5.0),
+                "one_line_review": str(one_line_review).strip(), "full_review": full_review,
+                "finished_date": finished_date_value.isoformat(), "created_at": now_str(),
             }
-            original_reviews_df = read_csv("reviews")
-            original_reviews_df = pd.concat([original_reviews_df, pd.DataFrame([review_row])], ignore_index=True)
-            write_csv("reviews", original_reviews_df)
-            saved_review = True
+
+        if storage_backend_name() == "supabase":
+            storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+            inserted = []
+            try:
+                if not storage.insert_row("reading_logs", log_row):
+                    raise StorageError("독서 기록 저장 결과가 비어 있습니다.")
+                inserted.append(("reading_logs", {"log_id": log_row["log_id"], "marathon_id": active_mid}))
+                if quote_row:
+                    if not storage.insert_row("quotes", quote_row):
+                        raise StorageError("좋았던 문장 저장 결과가 비어 있습니다.")
+                    inserted.append(("quotes", {"quote_id": quote_row["quote_id"], "marathon_id": active_mid}))
+                    saved_quote = True
+                if review_row:
+                    if not storage.insert_row("reviews", review_row):
+                        raise StorageError("완독 감상 저장 결과가 비어 있습니다.")
+                    inserted.append(("reviews", {"review_id": review_row["review_id"], "marathon_id": active_mid}))
+                    saved_review = True
+            except Exception as exc:
+                cleanup_errors = []
+                for table, filters in reversed(inserted):
+                    try:
+                        storage.delete_rows(table, filters)
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(cleanup_exc.__class__.__name__)
+                suffix = " 보상 삭제를 시도했습니다." if inserted else ""
+                if cleanup_errors:
+                    suffix += " 일부 정리 작업은 실패했으므로 관리자 확인이 필요합니다."
+                st.error(f"오늘의 기록 저장에 실패했습니다: {exc}.{suffix}")
+                return
+        else:
+            original_logs_df = pd.concat([read_csv("reading_logs"), pd.DataFrame([log_row])], ignore_index=True)
+            write_csv("reading_logs", original_logs_df)
+            if quote_row:
+                write_csv("quotes", pd.concat([read_csv("quotes"), pd.DataFrame([quote_row])], ignore_index=True))
+                saved_quote = True
+            if review_row:
+                write_csv("reviews", pd.concat([read_csv("reviews"), pd.DataFrame([review_row])], ignore_index=True))
+                saved_review = True
 
         messages = [
             "오늘의 독서 기록을 저장했습니다.",
@@ -2222,9 +2422,14 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, ma
                     confirm_col, cancel_col = st.columns(2)
                     with confirm_col:
                         if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                            original_logs = read_csv("reading_logs")
-                            updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
-                            write_csv("reading_logs", updated_logs)
+                            if storage_backend_name() == "supabase":
+                                get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
+                                    "reading_logs", {"log_id": str(row.log_id), "marathon_id": str(marathon_id or row.marathon_id)}
+                                )
+                            else:
+                                original_logs = read_csv("reading_logs")
+                                updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
+                                write_csv("reading_logs", updated_logs)
                             st.session_state.pop("pending_delete_log_id", None)
                             st.session_state["reading_log_delete_feedback"] = "독서 기록을 삭제했습니다. 대시보드와 리포트는 삭제된 기록을 기준으로 다시 계산됩니다."
                             st.rerun()
@@ -2269,9 +2474,14 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon
                 if pending_delete_id == str(row.quote_id):
                     st.warning("정말 이 문장을 삭제할까요?")
                     if st.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        original_quotes = read_csv("quotes")
-                        updated_quotes = original_quotes[original_quotes["quote_id"].astype(str) != str(row.quote_id)].copy()
-                        write_csv("quotes", updated_quotes)
+                        if storage_backend_name() == "supabase":
+                            get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
+                                "quotes", {"quote_id": str(row.quote_id), "marathon_id": str(marathon_id or row.marathon_id)}
+                            )
+                        else:
+                            original_quotes = read_csv("quotes")
+                            updated_quotes = original_quotes[original_quotes["quote_id"].astype(str) != str(row.quote_id)].copy()
+                            write_csv("quotes", updated_quotes)
                         st.session_state.pop("pending_delete_quote_id", None)
                         st.session_state["quote_delete_feedback"] = "좋았던 문장을 삭제했습니다. 가족 책장 관리 상태가 다시 계산됩니다."
                         st.rerun()
@@ -2301,7 +2511,7 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, maratho
         with st.container(border=True):
             content_col, action_col = st.columns([5, 1.4])
             with content_col:
-                st.markdown(f"#### {'⭐' * safe_int(row.rating, 0)} 《{get_book_title(row.book_id, books_df)}》")
+                st.markdown(f"#### {format_moon_rating(row.rating)} 《{get_book_title(row.book_id, books_df)}》")
                 st.write(row.one_line_review)
                 full_review = str(row.full_review or "").strip()
                 if full_review:
@@ -2314,9 +2524,14 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, maratho
                 if pending_delete_id == str(row.review_id):
                     st.warning("정말 이 감상을 삭제할까요?")
                     if st.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        original_reviews = read_csv("reviews")
-                        updated_reviews = original_reviews[original_reviews["review_id"].astype(str) != str(row.review_id)].copy()
-                        write_csv("reviews", updated_reviews)
+                        if storage_backend_name() == "supabase":
+                            get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
+                                "reviews", {"review_id": str(row.review_id), "marathon_id": str(marathon_id or row.marathon_id)}
+                            )
+                        else:
+                            original_reviews = read_csv("reviews")
+                            updated_reviews = original_reviews[original_reviews["review_id"].astype(str) != str(row.review_id)].copy()
+                            write_csv("reviews", updated_reviews)
                         st.session_state.pop("pending_delete_review_id", None)
                         st.session_state["review_delete_feedback"] = "완독 감상을 삭제했습니다. 가족 책장 상태와 리포트가 다시 계산됩니다."
                         st.rerun()
@@ -2428,7 +2643,11 @@ def page_settings(data: dict) -> None:
     with st.expander("🛠️ 개발/시연용 도구", expanded=False):
         st.caption("발표 시연이나 초기 테스트가 필요할 때만 사용하세요. 기존 CSV 데이터가 샘플 데이터로 초기화됩니다.")
         st.warning("샘플 데이터 생성 / 전체 초기화는 기존 기록을 덮어쓰는 개발·시연용 기능입니다. 실제 사용 중 새 달을 시작할 때는 아래의 '새 독서마라톤 시작' 기능을 사용해주세요.")
-        if st.button("🎁 샘플 데이터 생성 / 전체 초기화", type="primary", key="settings_create_sample_data", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
+        if st.button(
+            "🎁 샘플 데이터 생성 / 전체 초기화", type="primary", key="settings_create_sample_data",
+            disabled=(not is_admin() or storage_backend_name() == "supabase"),
+            help=("샘플 전체 초기화는 CSV 백엔드에서만 지원합니다." if storage_backend_name() == "supabase" else (None if is_admin() else admin_disabled_help())),
+        ):
             create_sample_data()
             st.success("샘플 데이터가 생성되었습니다. 왼쪽 메뉴나 새로고침으로 화면을 확인해주세요.")
             st.rerun()
@@ -2449,12 +2668,19 @@ def page_settings(data: dict) -> None:
         if not mask.any():
             st.warning("수정할 active 마라톤을 찾지 못했습니다.")
         else:
-            latest_settings.loc[mask, "marathon_name"] = marathon_name
-            latest_settings.loc[mask, "start_date"] = start_date.isoformat()
-            latest_settings.loc[mask, "end_date"] = end_date.isoformat()
-            latest_settings.loc[mask, "family_target_pages"] = family_target_pages
-            latest_settings.loc[mask, "unit_name"] = unit_name
-            write_csv("settings", latest_settings)
+            values = {
+                "marathon_name": marathon_name,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "family_target_pages": safe_int(family_target_pages, 2000),
+                "unit_name": unit_name,
+            }
+            if storage_backend_name() == "supabase":
+                get_storage(DATA_DIR, DEFAULT_SETTINGS).update_rows("settings", {"marathon_id": str(active_id)}, values)
+            else:
+                for column, value in values.items():
+                    latest_settings.loc[mask, column] = value
+                write_csv("settings", latest_settings)
             st.success("현재 독서마라톤 설정을 저장했습니다.")
             st.rerun()
 
@@ -2537,8 +2763,19 @@ def page_settings(data: dict) -> None:
                     st.session_state[delete_key] = selected_mid
                     st.rerun()
 
+    runner_feedback = st.session_state.pop("runner_add_feedback", None)
+    if runner_feedback:
+        level, message = runner_feedback
+        if level == "success":
+            st.success(message)
+        else:
+            st.warning(message)
+
     st.subheader("🏃 새 러너 추가")
-    st.caption("러너 유형에 따라 기본 가중치가 제안됩니다. 가중치는 필요하면 직접 수정할 수 있습니다.")
+    if storage_backend_name() == "supabase":
+        st.caption("Supabase CRUD가 연결되어 있습니다. 관리자 모드에서 러너·책·기록·마라톤을 추가·수정·삭제할 수 있습니다.")
+    else:
+        st.caption("러너 유형에 따라 기본 가중치가 제안됩니다. 가중치는 필요하면 직접 수정할 수 있습니다.")
     new_runner_age = st.selectbox("러너 유형", AGE_GROUP_OPTIONS, index=0, key="new_runner_age_group_select")
     with st.form("member_form"):
         col1, col2 = st.columns(2)
@@ -2555,7 +2792,11 @@ def page_settings(data: dict) -> None:
             key=f"new_runner_weight_{age_group}",
             help="기본값: 성인 1.0, 청소년 1.1, 어린이 1.4, 유아 2.0",
         )
-        member_submit = st.form_submit_button("새 러너 추가", disabled=not is_admin())
+        member_submit = st.form_submit_button(
+            "새 러너 추가",
+            disabled=not can_add_runner(),
+            help=None if can_add_runner() else "관리자 모드에서만 새 러너를 추가할 수 있습니다.",
+        )
     if member_submit:
         if not name.strip():
             st.error("러너 이름을 입력해주세요.")
@@ -2569,10 +2810,29 @@ def page_settings(data: dict) -> None:
                 "avatar": avatar,
                 "created_at": now_str(),
             }
-            members_df = pd.concat([read_csv("family_members"), pd.DataFrame([row])], ignore_index=True)
-            write_csv("family_members", members_df)
-            st.success("새 러너를 추가했습니다.")
-            st.rerun()
+            try:
+                storage = get_storage(DATA_DIR, DEFAULT_SETTINGS)
+                if storage_backend_name() == "supabase":
+                    inserted = storage.insert_row("family_members", row)
+                    if not inserted:
+                        raise StorageError("Supabase가 추가된 러너 행을 반환하지 않았습니다.")
+                else:
+                    # CSV 백엔드는 기존 동작을 그대로 유지합니다.
+                    members_df = pd.concat(
+                        [read_csv("family_members"), pd.DataFrame([row])],
+                        ignore_index=True,
+                    )
+                    write_csv("family_members", members_df)
+
+                st.session_state["runner_add_feedback"] = (
+                    "success",
+                    f"{avatar} {name.strip()} 러너를 추가했습니다.",
+                )
+                st.rerun()
+            except (StorageError, StorageWriteDisabledError, RuntimeError) as exc:
+                st.error(f"러너 저장에 실패했습니다: {exc}")
+            except Exception as exc:
+                st.error(f"러너 저장 중 오류가 발생했습니다: {exc.__class__.__name__}")
 
     st.subheader("🏃 현재 함께 달리는 러너")
     members_df = read_csv("family_members")
@@ -2618,12 +2878,19 @@ def page_settings(data: dict) -> None:
                         if not mask.any():
                             st.warning("수정할 러너를 찾지 못했습니다.")
                         else:
-                            latest_members.loc[mask, "name"] = edited_name.strip()
-                            latest_members.loc[mask, "avatar"] = edited_avatar
-                            latest_members.loc[mask, "role"] = edited_role.strip()
-                            latest_members.loc[mask, "age_group"] = edited_age_group
-                            latest_members.loc[mask, "weight"] = edited_weight
-                            write_csv("family_members", latest_members)
+                            values = {
+                                "name": edited_name.strip(), "avatar": edited_avatar,
+                                "role": edited_role.strip(), "age_group": edited_age_group,
+                                "weight": safe_float(edited_weight, 1.0),
+                            }
+                            if storage_backend_name() == "supabase":
+                                get_storage(DATA_DIR, DEFAULT_SETTINGS).update_rows(
+                                    "family_members", {"member_id": member_id}, values
+                                )
+                            else:
+                                for column, value in values.items():
+                                    latest_members.loc[mask, column] = value
+                                write_csv("family_members", latest_members)
                             st.success("러너 정보를 저장했습니다.")
                             st.rerun()
 
@@ -2639,11 +2906,14 @@ def page_settings(data: dict) -> None:
                     if c1.button("삭제 확인", key=f"confirm_delete_member_{member_id}", type="primary", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
                         result = delete_runner_and_related_data(member_id)
                         st.session_state.pop(delete_state_key, None)
-                        st.success(
-                            f"러너를 삭제했습니다. "
-                            f"함께 정리된 항목: 책장 {result['books']}개, 독서 기록 {result['logs']}개, "
-                            f"좋았던 문장 {result['quotes']}개, 완독 감상 {result['reviews']}개"
-                        )
+                        if result.get("error"):
+                            st.error(result["error"])
+                        else:
+                            st.success(
+                                f"러너를 삭제했습니다. "
+                                f"함께 정리된 항목: 책장 {result['books']}개, 독서 기록 {result['logs']}개, "
+                                f"좋았던 문장 {result['quotes']}개, 완독 감상 {result['reviews']}개"
+                            )
                         st.rerun()
                     if c2.button("취소", key=f"cancel_delete_member_{member_id}"):
                         st.session_state.pop(delete_state_key, None)
@@ -2685,9 +2955,15 @@ def page_settings(data: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
-    ensure_csv_files()
-    migrate_data_schema()
-    data = load_all_data()
+    try:
+        ensure_csv_files()
+        migrate_data_schema()
+        data = load_all_data()
+    except (StorageError, RuntimeError) as exc:
+        st.error("데이터 저장소에 연결하지 못했습니다.")
+        st.code(str(exc))
+        st.info("STORAGE_BACKEND, SUPABASE_URL, SUPABASE_KEY 설정과 Supabase 테이블을 확인해주세요.")
+        st.stop()
 
     with st.sidebar:
         st.title("📚 독서마라톤")
@@ -2698,8 +2974,10 @@ def main() -> None:
             ["홈 / 대시보드", "책 검색 / 책 등록", "가족 책장", "오늘의 독서 기록", "기록 모아보기", "월간 리포트", "설정 / 러너 관리"],
         )
         st.divider()
-        st.caption("CSV 저장 방식 MVP")
-        st.caption(f"데이터 폴더: {DATA_DIR.name}/")
+        backend_label = "Supabase · 영구 저장" if storage_backend_name() == "supabase" else "CSV"
+        st.caption(f"저장소: {backend_label}")
+        if storage_backend_name() == "csv":
+            st.caption(f"데이터 폴더: {DATA_DIR.name}/")
 
     if page == "홈 / 대시보드":
         page_dashboard(data)
