@@ -2460,7 +2460,21 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon
         with st.container(border=True):
             content_col, action_col = st.columns([5, 1.4])
             with content_col:
-                st.markdown(f"> {row.quote_text}")
+                quote_display = html.escape(str(row.quote_text or "").strip())
+                st.markdown(
+                    f"""
+                    <div style="
+                        color: #111111;
+                        font-size: 1.08rem;
+                        font-weight: 600;
+                        line-height: 1.75;
+                        padding: 0.35rem 0 0.7rem 0;
+                    ">
+                        “{quote_display}”
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
                 st.caption(
                     f"작성자: {get_member_name(row.member_id, members_df)} · "
                     f"책: 《{get_book_title(row.book_id, books_df)}》 · "
@@ -2844,13 +2858,17 @@ def page_settings(data: dict) -> None:
         for _, member in members_df.iterrows():
             member_id = str(member.get("member_id", ""))
             current_avatar = str(member.get("avatar", "") or "👨").strip()
-            avatar_options = emoji_options_with_current(current_avatar)
-            current_index = avatar_options.index(current_avatar) if current_avatar in avatar_options else 0
             with st.expander(f"{current_avatar} {member.get('name', '러너')} 러너 정보 수정", expanded=False):
                 with st.form(f"edit_member_form_{member_id}"):
                     col1, col2 = st.columns(2)
                     edited_name = col1.text_input("이름", value=str(member.get("name", "")), key=f"edit_name_{member_id}")
-                    edited_avatar = col2.selectbox("이모지/avatar", avatar_options, index=current_index, key=f"edit_avatar_{member_id}")
+                    edited_avatar = col2.text_input(
+                        "이모지/avatar",
+                        value=current_avatar,
+                        key=f"edit_avatar_{member_id}",
+                        help="Windows에서는 Win + . 키를 눌러 원하는 이모지를 입력할 수 있습니다.",
+                        max_chars=12,
+                    )
                     edited_role = st.text_input("역할", value=str(member.get("role", "")), key=f"edit_role_{member_id}")
                     age_options = AGE_GROUP_OPTIONS
                     current_age = normalize_age_group(member.get("age_group", "성인"))
@@ -2879,8 +2897,10 @@ def page_settings(data: dict) -> None:
                             st.warning("수정할 러너를 찾지 못했습니다.")
                         else:
                             values = {
-                                "name": edited_name.strip(), "avatar": edited_avatar,
-                                "role": edited_role.strip(), "age_group": edited_age_group,
+                                "name": edited_name.strip(),
+                                "avatar": str(edited_avatar or "").strip() or current_avatar or "🌟",
+                                "role": edited_role.strip(),
+                                "age_group": edited_age_group,
                                 "weight": safe_float(edited_weight, 1.0),
                             }
                             if storage_backend_name() == "supabase":
