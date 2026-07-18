@@ -59,6 +59,8 @@ create table if not exists public.books (
     pubdate date null,
     total_pages integer not null default 0
         check (total_pages >= 0),
+    book_weight numeric(6,2) not null default 1.00
+        check (book_weight > 0 and book_weight <= 20),
     source_api text not null default 'manual',
     created_at timestamptz not null default now(),
 

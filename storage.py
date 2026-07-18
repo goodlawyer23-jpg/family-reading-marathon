@@ -37,7 +37,7 @@ TABLE_COLUMNS: dict[str, list[str]] = {
     ],
     "books": [
         "book_id", "marathon_id", "reader_member_id", "title", "author", "publisher",
-        "isbn", "image_url", "description", "pubdate", "total_pages", "source_api", "created_at",
+        "isbn", "image_url", "description", "pubdate", "total_pages", "book_weight", "source_api", "created_at",
     ],
     "reading_logs": [
         "log_id", "marathon_id", "member_id", "book_id", "reading_date", "pages_read",

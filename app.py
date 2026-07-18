@@ -48,7 +48,7 @@ SAMPLE_DIR = BASE_DIR / "sample_data"
 CSV_COLUMNS = {
     "books": [
         "book_id", "marathon_id", "reader_member_id", "title", "author", "publisher", "isbn", "image_url",
-        "description", "pubdate", "total_pages", "source_api", "created_at",
+        "description", "pubdate", "total_pages", "book_weight", "source_api", "created_at",
     ],
     "family_members": [
         "member_id", "name", "role", "age_group", "weight", "avatar", "created_at",
@@ -308,6 +308,12 @@ def migrate_data_schema() -> None:
         blank_mask = df["marathon_id"].astype(str).str.strip().eq("")
         if blank_mask.any():
             df.loc[blank_mask, "marathon_id"] = active_id
+        if key == "books":
+            if "book_weight" not in df.columns:
+                df["book_weight"] = 1.0
+            invalid_weight = df["book_weight"].apply(lambda x: safe_float(x, 0) <= 0)
+            if invalid_weight.any():
+                df.loc[invalid_weight, "book_weight"] = 1.0
         write_csv(key, df)
 
 
@@ -647,17 +653,94 @@ def get_book_total_pages(book_id: str, books_df: pd.DataFrame) -> int:
     return safe_int(found.iloc[0].get("total_pages", 0), 0)
 
 
+def get_book_weight(book_id: str, books_df: pd.DataFrame) -> float:
+    """책별 가중치를 반환합니다. 기존 데이터는 1.0으로 처리합니다."""
+    if books_df.empty or "book_id" not in books_df.columns:
+        return 1.0
+    found = books_df[books_df["book_id"].astype(str) == str(book_id)]
+    if found.empty:
+        return 1.0
+    return max(0.1, safe_float(found.iloc[0].get("book_weight", 1.0), 1.0))
+
+
+def calculate_weighted_pages(pages_read: int, member_id: str, book_id: str, members_df: pd.DataFrame, books_df: pd.DataFrame) -> float:
+    member_rows = members_df[members_df["member_id"].astype(str) == str(member_id)] if not members_df.empty else pd.DataFrame()
+    member_weight = safe_float(member_rows.iloc[0].get("weight", 1.0), 1.0) if not member_rows.empty else 1.0
+    book_weight = get_book_weight(book_id, books_df)
+    return round(safe_int(pages_read, 0) * member_weight * book_weight, 2)
+
+
+def update_single_row(table_name: str, filters: dict, values: dict) -> bool:
+    """CSV와 Supabase에서 한 행을 안전하게 수정합니다."""
+    if storage_backend_name() == "supabase":
+        return bool(get_storage(DATA_DIR, DEFAULT_SETTINGS).update_rows(table_name, filters, values))
+    df = read_csv(table_name)
+    mask = pd.Series(True, index=df.index)
+    for column, value in filters.items():
+        if column not in df.columns:
+            return False
+        mask &= df[column].astype(str) == str(value)
+    if not mask.any():
+        return False
+    for column, value in values.items():
+        if column in df.columns:
+            df.loc[mask, column] = value
+    write_csv(table_name, df)
+    return True
+
+
+def recalculate_weighted_logs(member_id: str | None = None, book_id: str | None = None) -> int:
+    """현재 러너·책 가중치를 기존 독서 기록에 다시 반영합니다."""
+    logs_df = read_csv("reading_logs")
+    if logs_df.empty:
+        return 0
+    target = pd.Series(True, index=logs_df.index)
+    if member_id:
+        target &= logs_df["member_id"].astype(str) == str(member_id)
+    if book_id:
+        target &= logs_df["book_id"].astype(str) == str(book_id)
+
+    members_df = read_csv("family_members")
+    books_df = read_csv("books")
+    changed = 0
+    for idx, row in logs_df.loc[target].iterrows():
+        new_value = calculate_weighted_pages(
+            safe_int(row.get("pages_read", 0), 0),
+            str(row.get("member_id", "")),
+            str(row.get("book_id", "")),
+            members_df,
+            books_df,
+        )
+        old_value = safe_float(row.get("weighted_pages", 0), 0)
+        if abs(old_value - new_value) < 0.001:
+            continue
+        filters = {"log_id": str(row.get("log_id", ""))}
+        if str(row.get("marathon_id", "")).strip():
+            filters["marathon_id"] = str(row.get("marathon_id", ""))
+        if update_single_row("reading_logs", filters, {"weighted_pages": new_value}):
+            changed += 1
+    return changed
+
+
 def enrich_logs(logs_df: pd.DataFrame, members_df: pd.DataFrame, books_df: pd.DataFrame) -> pd.DataFrame:
     if logs_df.empty:
         return logs_df.copy()
     df = logs_df.copy()
     df["pages_read"] = df["pages_read"].apply(safe_int)
-    df["weighted_pages"] = df["weighted_pages"].apply(safe_float)
+    df["weighted_pages"] = df.apply(
+        lambda row: calculate_weighted_pages(
+            row.get("pages_read", 0),
+            str(row.get("member_id", "")),
+            str(row.get("book_id", "")),
+            members_df,
+            books_df,
+        ),
+        axis=1,
+    )
     df["member_name"] = df["member_id"].apply(lambda x: get_member_name(x, members_df))
     df["book_title"] = df["book_id"].apply(lambda x: get_book_title(x, books_df))
     df["reading_date_dt"] = pd.to_datetime(df["reading_date"], errors="coerce")
     return df
-
 
 def member_options(members_df: pd.DataFrame) -> dict:
     return {f"{row.avatar} {row.name} ({row.role})": row.member_id for row in members_df.itertuples()}
@@ -776,6 +859,8 @@ def create_sample_data() -> None:
         {"book_id": "book_006", "marathon_id": sample_marathon_id, "reader_member_id": "member_child1", "title": "해리 포터와 마법사의 돌", "author": "J.K. 롤링", "publisher": "문학수첩", "isbn": "9788983927620", "image_url": PLACEHOLDER_COVER, "description": "마법 학교에서 시작되는 모험", "pubdate": "2019-11-19", "total_pages": 268, "source_api": "sample", "created_at": now_str()},
         {"book_id": "book_007", "marathon_id": sample_marathon_id, "reader_member_id": "member_child2", "title": "채소 학교와 쌍둥이 딸기", "author": "나카야 미와", "publisher": "웅진주니어", "isbn": "9788901253541", "image_url": PLACEHOLDER_COVER, "description": "채소 친구들이 등장하는 귀여운 그림책", "pubdate": "2021-06-30", "total_pages": 40, "source_api": "sample", "created_at": now_str()},
     ], columns=CSV_COLUMNS["books"])
+
+    books["book_weight"] = 1.0
 
     logs_raw = [
         ("member_dad", "book_002", 0, 35, 1, 35, "출근길에 읽음"),
@@ -1185,6 +1270,7 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
     title = clean_html(book_data.get("title", "")).strip()
     reader_member_id = str(reader_member_id or "").strip()
     total_pages = safe_int(book_data.get("total_pages"), 0)
+    book_weight = max(0.1, safe_float(book_data.get("book_weight", 1.0), 1.0))
     lookup_result = {"status": "not_called", "message": ""}
 
     if not reader_member_id:
@@ -1268,6 +1354,7 @@ def add_book_to_library(book_data: dict, reader_member_id: str = "") -> tuple[bo
     row["image_url"] = row.get("image_url") or PLACEHOLDER_COVER
     row["isbn"] = str(row.get("isbn", "") or "").strip()
     row["total_pages"] = total_pages
+    row["book_weight"] = book_weight
     row["source_api"] = row.get("source_api") or "manual"
     row["created_at"] = now_str()
 
@@ -1812,6 +1899,15 @@ def page_book_search(data: dict) -> None:
                             key=f"search_total_pages_{global_idx}_{selected_reader_id}",
                             help="페이지 수를 알고 있으면 책장에 추가하기 전에 입력해주세요. 0이면 나중에 가족 책장에서 수정할 수 있습니다.",
                         )
+                        book_weight_input = st.number_input(
+                            "책별 가중치",
+                            min_value=0.1,
+                            max_value=20.0,
+                            step=0.1,
+                            value=1.0,
+                            key=f"search_book_weight_{global_idx}_{selected_reader_id}",
+                            help="일반 책은 1.0, 영어책처럼 난도가 높은 책은 1.5 등으로 설정할 수 있습니다.",
+                        )
                         if description:
                             with st.expander("책 소개 보기", expanded=False):
                                 st.write(description)
@@ -1826,6 +1922,7 @@ def page_book_search(data: dict) -> None:
                                 "description": description,
                                 "pubdate": pubdate,
                                 "total_pages": safe_int(total_pages_input, 0),
+                                "book_weight": safe_float(book_weight_input, 1.0),
                             })
                             success, msg, detail = add_book_to_library(book_to_add, selected_reader_id)
                             if success:
@@ -1859,6 +1956,7 @@ def page_book_search(data: dict) -> None:
             description = st.text_area("책 소개")
             pubdate = st.text_input("출간일", placeholder="YYYY-MM-DD 또는 YYYYMMDD")
             total_pages = st.number_input("전체 페이지 수", min_value=0, step=1, value=100)
+            manual_book_weight = st.number_input("책별 가중치", min_value=0.1, max_value=20.0, step=0.1, value=1.0, help="일반 책은 1.0입니다.")
             submitted = st.form_submit_button(
                 "직접 등록",
                 disabled=not can_add_book(),
@@ -1871,7 +1969,7 @@ def page_book_search(data: dict) -> None:
                 success, msg, detail = add_book_to_library({
                     "book_id": make_id("book"), "title": title, "author": author, "publisher": publisher,
                     "isbn": isbn, "image_url": image_url, "description": description, "pubdate": pubdate,
-                    "total_pages": total_pages, "source_api": "manual", "created_at": now_str(),
+                    "total_pages": total_pages, "book_weight": manual_book_weight, "source_api": "manual", "created_at": now_str(),
                 }, m_options[reader_label])
                 if success:
                     st.session_state["book_add_feedback"] = ("success", f"《{clean_html(title)}》을 {reader_label}의 책장에 추가했습니다. {msg}", detail)
@@ -1986,6 +2084,36 @@ def page_library(data: dict) -> None:
                                     st.warning(f"전체 페이지 수 저장 실패: {exc}")
                             else:
                                 st.warning("수정할 책을 찾지 못했습니다.")
+
+                    current_book_weight = get_book_weight(str(book.get("book_id", "")), books_df)
+                    st.caption(f"책별 가중치 ×{current_book_weight:.1f}")
+                    with st.expander("책별 가중치 수정", expanded=False):
+                        edited_book_weight = st.number_input(
+                            "새 책별 가중치",
+                            min_value=0.1,
+                            max_value=20.0,
+                            step=0.1,
+                            value=float(current_book_weight),
+                            key=f"library_book_weight_{book['book_id']}",
+                            help="러너 가중치와 곱해집니다. 예: 러너 2.0 × 영어책 1.5 = 최종 3.0배",
+                        )
+                        if st.button("책별 가중치 저장", key=f"save_book_weight_{book['book_id']}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
+                            try:
+                                updated = update_single_row(
+                                    "books",
+                                    {"book_id": str(book["book_id"]), "marathon_id": str(selected_marathon_id)},
+                                    {"book_weight": safe_float(edited_book_weight, 1.0)},
+                                )
+                                if not updated:
+                                    raise StorageError("수정할 책을 찾지 못했습니다.")
+                                changed_logs = recalculate_weighted_logs(book_id=str(book["book_id"]))
+                                st.session_state["library_manage_feedback"] = (
+                                    "success",
+                                    f"책별 가중치를 ×{safe_float(edited_book_weight, 1.0):.1f}로 저장하고 기존 기록 {changed_logs}개를 다시 계산했습니다.",
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.warning(f"책별 가중치 저장 실패: {exc}")
 
                     book_id = str(book.get("book_id", "")).strip()
                     manage_expander_label = f"책장 관리 · {title[:14]} · {registered_reader or '러너 미지정'}" if title else "책장 관리"
@@ -2295,7 +2423,8 @@ def page_today_reading(data: dict) -> None:
             return
 
         member_row = members_df[members_df["member_id"] == member_id].iloc[0]
-        weight = safe_float(member_row["weight"], 1.0)
+        member_weight = safe_float(member_row["weight"], 1.0)
+        selected_book_weight = get_book_weight(book_id, books_df)
         log_row = {
             "log_id": make_id("log"),
             "marathon_id": active_mid,
@@ -2303,7 +2432,7 @@ def page_today_reading(data: dict) -> None:
             "book_id": book_id,
             "reading_date": reading_date.isoformat(),
             "pages_read": safe_int(pages_read, 0),
-            "weighted_pages": round(safe_int(pages_read, 0) * weight, 1),
+            "weighted_pages": round(safe_int(pages_read, 0) * member_weight * selected_book_weight, 2),
             "start_page": safe_int(start_page, 0),
             "end_page": safe_int(end_page, 0),
             "memo": memo,
@@ -2380,9 +2509,9 @@ def page_today_reading(data: dict) -> None:
 
 
 def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
-    delete_feedback = st.session_state.pop("reading_log_delete_feedback", None)
-    if delete_feedback:
-        st.success(delete_feedback)
+    feedback = st.session_state.pop("reading_log_feedback", None)
+    if feedback:
+        st.success(feedback)
 
     raw_logs_df = read_csv("reading_logs")
     if marathon_id:
@@ -2392,61 +2521,77 @@ def render_reading_logs_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, ma
         st.write("아직 입력된 독서 기록이 없습니다.")
         return
 
-    view = logs_df.sort_values("created_at", ascending=False)
-    for row in view.itertuples():
+    st.caption("날짜, 읽은 페이지, 시작·끝 페이지와 메모를 수정할 수 있습니다. 수정 시 현재 러너·책 가중치로 다시 계산됩니다.")
+    for row in logs_df.sort_values("created_at", ascending=False).itertuples():
         with st.container(border=True):
-            cols = st.columns([1.2, 1.5, 2.2, 1.3, 1.2, 2.2, 1.3])
-            with cols[0]:
-                st.markdown(f"**{row.reading_date}**")
-            with cols[1]:
-                st.write(row.member_name)
-            with cols[2]:
-                st.markdown(f"**{row.book_title}**")
-            with cols[3]:
-                st.write(f"{safe_int(row.pages_read)}쪽")
-                st.caption(f"가중 {safe_float(row.weighted_pages):.1f}쪽")
-            with cols[4]:
-                start_page = safe_int(row.start_page, 0)
-                end_page = safe_int(row.end_page, 0)
-                if start_page or end_page:
-                    st.write(f"{start_page}~{end_page}쪽")
-                else:
-                    st.caption("범위 없음")
-            with cols[5]:
-                memo_text = str(row.memo or "").strip()
-                st.write(memo_text if memo_text else "메모 없음")
-            with cols[6]:
-                pending_delete_id = st.session_state.get("pending_delete_log_id")
-                if pending_delete_id == str(row.log_id):
-                    st.warning("정말 이 독서 기록을 삭제할까요?")
-                    confirm_col, cancel_col = st.columns(2)
-                    with confirm_col:
-                        if st.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                            if storage_backend_name() == "supabase":
-                                get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
-                                    "reading_logs", {"log_id": str(row.log_id), "marathon_id": str(marathon_id or row.marathon_id)}
-                                )
-                            else:
-                                original_logs = read_csv("reading_logs")
-                                updated_logs = original_logs[original_logs["log_id"].astype(str) != str(row.log_id)].copy()
-                                write_csv("reading_logs", updated_logs)
-                            st.session_state.pop("pending_delete_log_id", None)
-                            st.session_state["reading_log_delete_feedback"] = "독서 기록을 삭제했습니다. 대시보드와 리포트는 삭제된 기록을 기준으로 다시 계산됩니다."
-                            st.rerun()
-                    with cancel_col:
-                        if st.button("취소", key=f"cancel_delete_log_{row.log_id}"):
-                            st.session_state.pop("pending_delete_log_id", None)
-                            st.rerun()
-                else:
-                    if st.button("이 기록 삭제", key=f"delete_log_{row.log_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        st.session_state["pending_delete_log_id"] = str(row.log_id)
-                        st.rerun()
+            st.markdown(f"**{row.reading_date} · {row.member_name} · 《{row.book_title}》**")
+            st.write(f"{safe_int(row.pages_read)}쪽 · 가중 반영 {safe_float(row.weighted_pages):.2f}쪽")
+            start_page, end_page = safe_int(row.start_page, 0), safe_int(row.end_page, 0)
+            st.caption(f"읽기 범위: {start_page}~{end_page}쪽" if (start_page or end_page) else "읽기 범위 미입력")
+            memo_text = str(row.memo or "").strip()
+            if memo_text:
+                st.write(memo_text)
 
+            with st.expander("이 기록 수정", expanded=False):
+                try:
+                    current_date = pd.to_datetime(row.reading_date).date()
+                except Exception:
+                    current_date = date.today()
+                with st.form(f"edit_log_form_{row.log_id}"):
+                    edit_date = st.date_input("날짜", value=current_date, key=f"edit_log_date_{row.log_id}")
+                    c1, c2, c3 = st.columns(3)
+                    edit_pages = c1.number_input("읽은 페이지 수", min_value=1, step=1, value=max(1, safe_int(row.pages_read, 1)), key=f"edit_log_pages_{row.log_id}")
+                    edit_start = c2.number_input("시작 페이지", min_value=0, step=1, value=start_page, key=f"edit_log_start_{row.log_id}")
+                    edit_end = c3.number_input("끝 페이지", min_value=0, step=1, value=end_page, key=f"edit_log_end_{row.log_id}")
+                    edit_memo = st.text_area("메모", value=memo_text, key=f"edit_log_memo_{row.log_id}")
+                    edit_submit = st.form_submit_button("수정 내용 저장", disabled=not is_admin())
+                if edit_submit:
+                    if edit_start and edit_end and edit_end < edit_start:
+                        st.error("끝 페이지는 시작 페이지보다 크거나 같아야 합니다.")
+                    else:
+                        weighted = calculate_weighted_pages(edit_pages, row.member_id, row.book_id, members_df, books_df)
+                        ok = update_single_row(
+                            "reading_logs",
+                            {"log_id": str(row.log_id), "marathon_id": str(marathon_id or row.marathon_id)},
+                            {
+                                "reading_date": edit_date.isoformat(),
+                                "pages_read": safe_int(edit_pages, 1),
+                                "weighted_pages": weighted,
+                                "start_page": safe_int(edit_start, 0),
+                                "end_page": safe_int(edit_end, 0),
+                                "memo": str(edit_memo or "").strip(),
+                            },
+                        )
+                        if ok:
+                            st.session_state["reading_log_feedback"] = "독서 기록을 수정했습니다. 대시보드와 리포트도 다시 계산됩니다."
+                            st.rerun()
+                        else:
+                            st.error("수정할 독서 기록을 찾지 못했습니다.")
+
+            pending = st.session_state.get("pending_delete_log_id")
+            if pending == str(row.log_id):
+                st.warning("정말 이 독서 기록을 삭제할까요?")
+                c1, c2 = st.columns(2)
+                if c1.button("삭제 확인", key=f"confirm_delete_log_{row.log_id}", disabled=not is_admin()):
+                    if storage_backend_name() == "supabase":
+                        get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows("reading_logs", {"log_id": str(row.log_id), "marathon_id": str(marathon_id or row.marathon_id)})
+                    else:
+                        df = read_csv("reading_logs")
+                        write_csv("reading_logs", df[df["log_id"].astype(str) != str(row.log_id)].copy())
+                    st.session_state.pop("pending_delete_log_id", None)
+                    st.session_state["reading_log_feedback"] = "독서 기록을 삭제했습니다."
+                    st.rerun()
+                if c2.button("취소", key=f"cancel_delete_log_{row.log_id}"):
+                    st.session_state.pop("pending_delete_log_id", None)
+                    st.rerun()
+            elif st.button("이 기록 삭제", key=f"delete_log_{row.log_id}", disabled=not is_admin()):
+                st.session_state["pending_delete_log_id"] = str(row.log_id)
+                st.rerun()
 
 def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
-    delete_feedback = st.session_state.pop("quote_delete_feedback", None)
-    if delete_feedback:
-        st.success(delete_feedback)
+    feedback = st.session_state.pop("quote_feedback", None)
+    if feedback:
+        st.success(feedback)
 
     quotes_df = read_csv("quotes")
     if marathon_id:
@@ -2455,63 +2600,61 @@ def render_quotes_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon
         st.write("아직 저장된 문장이 없습니다.")
         return
 
-    st.caption("잘못 남긴 문장은 삭제할 수 있습니다. 문장을 삭제하면 가족 책장의 책장 관리 상태도 다시 계산됩니다.")
+    st.caption("문장, 페이지 번호와 내 생각을 직접 수정할 수 있습니다.")
     for row in quotes_df.sort_values("created_at", ascending=False).itertuples():
         with st.container(border=True):
-            content_col, action_col = st.columns([5, 1.4])
-            with content_col:
-                quote_display = html.escape(str(row.quote_text or "").strip())
-                st.markdown(
-                    f"""
-                    <div style="
-                        color: #111111;
-                        font-size: 1.08rem;
-                        font-weight: 600;
-                        line-height: 1.75;
-                        padding: 0.35rem 0 0.7rem 0;
-                    ">
-                        “{quote_display}”
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.caption(
-                    f"작성자: {get_member_name(row.member_id, members_df)} · "
-                    f"책: 《{get_book_title(row.book_id, books_df)}》 · "
-                    f"p.{safe_int(row.page_number, 0)} · 작성일 {row.created_at}"
-                )
-                comment = str(row.comment or "").strip()
-                if comment:
-                    st.write(comment)
-            with action_col:
-                pending_delete_id = st.session_state.get("pending_delete_quote_id")
-                if pending_delete_id == str(row.quote_id):
-                    st.warning("정말 이 문장을 삭제할까요?")
-                    if st.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        if storage_backend_name() == "supabase":
-                            get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
-                                "quotes", {"quote_id": str(row.quote_id), "marathon_id": str(marathon_id or row.marathon_id)}
-                            )
-                        else:
-                            original_quotes = read_csv("quotes")
-                            updated_quotes = original_quotes[original_quotes["quote_id"].astype(str) != str(row.quote_id)].copy()
-                            write_csv("quotes", updated_quotes)
-                        st.session_state.pop("pending_delete_quote_id", None)
-                        st.session_state["quote_delete_feedback"] = "좋았던 문장을 삭제했습니다. 가족 책장 관리 상태가 다시 계산됩니다."
-                        st.rerun()
-                    if st.button("취소", key=f"cancel_delete_quote_{row.quote_id}"):
-                        st.session_state.pop("pending_delete_quote_id", None)
-                        st.rerun()
-                else:
-                    if st.button("문장 삭제", key=f"delete_quote_{row.quote_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        st.session_state["pending_delete_quote_id"] = str(row.quote_id)
-                        st.rerun()
+            quote_display = html.escape(str(row.quote_text or "").strip())
+            st.markdown(f'<div style="color:#111;font-size:1.08rem;font-weight:600;line-height:1.75;">“{quote_display}”</div>', unsafe_allow_html=True)
+            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · 책: 《{get_book_title(row.book_id, books_df)}》 · p.{safe_int(row.page_number, 0)} · 작성일 {row.created_at}")
+            comment = str(row.comment or "").strip()
+            if comment:
+                st.write(comment)
 
+            with st.expander("이 문장 수정", expanded=False):
+                with st.form(f"edit_quote_form_{row.quote_id}"):
+                    edit_page = st.number_input("페이지 번호", min_value=0, step=1, value=safe_int(row.page_number, 0), key=f"edit_quote_page_{row.quote_id}")
+                    edit_text = st.text_area("좋았던 문장", value=str(row.quote_text or ""), key=f"edit_quote_text_{row.quote_id}")
+                    edit_comment = st.text_area("내 생각", value=comment, key=f"edit_quote_comment_{row.quote_id}")
+                    edit_submit = st.form_submit_button("수정 내용 저장", disabled=not is_admin())
+                if edit_submit:
+                    if not edit_text.strip():
+                        st.error("좋았던 문장을 입력해주세요.")
+                    else:
+                        ok = update_single_row(
+                            "quotes",
+                            {"quote_id": str(row.quote_id), "marathon_id": str(marathon_id or row.marathon_id)},
+                            {"page_number": safe_int(edit_page, 0), "quote_text": edit_text.strip(), "comment": edit_comment.strip()},
+                        )
+                        if ok:
+                            st.session_state["quote_feedback"] = "좋았던 문장을 수정했습니다."
+                            st.rerun()
+                        else:
+                            st.error("수정할 문장을 찾지 못했습니다.")
+
+            pending = st.session_state.get("pending_delete_quote_id")
+            if pending == str(row.quote_id):
+                st.warning("정말 이 문장을 삭제할까요?")
+                c1, c2 = st.columns(2)
+                if c1.button("삭제 확인", key=f"confirm_delete_quote_{row.quote_id}", disabled=not is_admin()):
+                    if storage_backend_name() == "supabase":
+                        get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows("quotes", {"quote_id": str(row.quote_id), "marathon_id": str(marathon_id or row.marathon_id)})
+                    else:
+                        df = read_csv("quotes")
+                        write_csv("quotes", df[df["quote_id"].astype(str) != str(row.quote_id)].copy())
+                    st.session_state.pop("pending_delete_quote_id", None)
+                    st.session_state["quote_feedback"] = "좋았던 문장을 삭제했습니다."
+                    st.rerun()
+                if c2.button("취소", key=f"cancel_delete_quote_{row.quote_id}"):
+                    st.session_state.pop("pending_delete_quote_id", None)
+                    st.rerun()
+            elif st.button("문장 삭제", key=f"delete_quote_{row.quote_id}", disabled=not is_admin()):
+                st.session_state["pending_delete_quote_id"] = str(row.quote_id)
+                st.rerun()
 
 def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, marathon_id: str | None = None) -> None:
-    delete_feedback = st.session_state.pop("review_delete_feedback", None)
-    if delete_feedback:
-        st.success(delete_feedback)
+    feedback = st.session_state.pop("review_feedback", None)
+    if feedback:
+        st.success(feedback)
 
     reviews_df = read_csv("reviews")
     if marathon_id:
@@ -2520,43 +2663,75 @@ def render_reviews_tab(members_df: pd.DataFrame, books_df: pd.DataFrame, maratho
         st.write("아직 저장된 감상이 없습니다.")
         return
 
-    st.caption("잘못 남긴 완독 감상은 삭제할 수 있습니다. 감상을 삭제하면 가족 책장의 완독 상태와 책장 관리 상태도 다시 계산됩니다.")
+    rating_options = [i / 2 for i in range(1, 11)]
+    st.caption("달 평점, 한 줄 감상, 자세한 감상과 완독일을 수정할 수 있습니다.")
     for row in reviews_df.sort_values("created_at", ascending=False).itertuples():
         with st.container(border=True):
-            content_col, action_col = st.columns([5, 1.4])
-            with content_col:
-                st.markdown(f"#### {format_moon_rating(row.rating)} 《{get_book_title(row.book_id, books_df)}》")
-                st.write(row.one_line_review)
-                full_review = str(row.full_review or "").strip()
-                if full_review:
-                    st.caption(full_review)
-                finished_date = str(row.finished_date or "").strip()
-                finished_text = f"완독일 {finished_date}" if finished_date else "완독일 미입력"
-                st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · {finished_text} · 작성일 {row.created_at}")
-            with action_col:
-                pending_delete_id = st.session_state.get("pending_delete_review_id")
-                if pending_delete_id == str(row.review_id):
-                    st.warning("정말 이 감상을 삭제할까요?")
-                    if st.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        if storage_backend_name() == "supabase":
-                            get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows(
-                                "reviews", {"review_id": str(row.review_id), "marathon_id": str(marathon_id or row.marathon_id)}
-                            )
-                        else:
-                            original_reviews = read_csv("reviews")
-                            updated_reviews = original_reviews[original_reviews["review_id"].astype(str) != str(row.review_id)].copy()
-                            write_csv("reviews", updated_reviews)
-                        st.session_state.pop("pending_delete_review_id", None)
-                        st.session_state["review_delete_feedback"] = "완독 감상을 삭제했습니다. 가족 책장 상태와 리포트가 다시 계산됩니다."
-                        st.rerun()
-                    if st.button("취소", key=f"cancel_delete_review_{row.review_id}"):
-                        st.session_state.pop("pending_delete_review_id", None)
-                        st.rerun()
-                else:
-                    if st.button("감상 삭제", key=f"delete_review_{row.review_id}", disabled=not is_admin(), help=None if is_admin() else admin_disabled_help()):
-                        st.session_state["pending_delete_review_id"] = str(row.review_id)
-                        st.rerun()
+            st.markdown(f"#### {format_moon_rating(row.rating)} 《{get_book_title(row.book_id, books_df)}》")
+            st.write(row.one_line_review)
+            full_review = str(row.full_review or "").strip()
+            if full_review:
+                st.caption(full_review)
+            finished_date_text = str(row.finished_date or "").strip()
+            st.caption(f"작성자: {get_member_name(row.member_id, members_df)} · 완독일 {finished_date_text or '미입력'} · 작성일 {row.created_at}")
 
+            with st.expander("이 감상 수정", expanded=False):
+                try:
+                    current_finished = pd.to_datetime(finished_date_text).date() if finished_date_text else date.today()
+                except Exception:
+                    current_finished = date.today()
+                with st.form(f"edit_review_form_{row.review_id}"):
+                    current_rating = normalize_rating(row.rating, 5.0)
+                    edit_rating = st.select_slider(
+                        "달 평점",
+                        options=rating_options,
+                        value=current_rating if current_rating in rating_options else 5.0,
+                        format_func=lambda x: f"{format_moon_rating(x, include_score=False)} {float(x):.1f}점",
+                        key=f"edit_review_rating_{row.review_id}",
+                    )
+                    edit_one_line = st.text_input("한 줄 감상", value=str(row.one_line_review or ""), key=f"edit_review_one_{row.review_id}")
+                    edit_full = st.text_area("자세한 감상", value=full_review, key=f"edit_review_full_{row.review_id}")
+                    edit_finished = st.date_input("완독일", value=current_finished, key=f"edit_review_date_{row.review_id}")
+                    edit_submit = st.form_submit_button("수정 내용 저장", disabled=not is_admin())
+                if edit_submit:
+                    if not edit_one_line.strip():
+                        st.error("한 줄 감상을 입력해주세요.")
+                    else:
+                        ok = update_single_row(
+                            "reviews",
+                            {"review_id": str(row.review_id), "marathon_id": str(marathon_id or row.marathon_id)},
+                            {
+                                "rating": normalize_rating(edit_rating, 5.0),
+                                "one_line_review": edit_one_line.strip(),
+                                "full_review": edit_full.strip(),
+                                "finished_date": edit_finished.isoformat(),
+                            },
+                        )
+                        if ok:
+                            st.session_state["review_feedback"] = "완독 감상과 달 평점을 수정했습니다."
+                            st.rerun()
+                        else:
+                            st.error("수정할 감상을 찾지 못했습니다.")
+
+            pending = st.session_state.get("pending_delete_review_id")
+            if pending == str(row.review_id):
+                st.warning("정말 이 감상을 삭제할까요?")
+                c1, c2 = st.columns(2)
+                if c1.button("삭제 확인", key=f"confirm_delete_review_{row.review_id}", disabled=not is_admin()):
+                    if storage_backend_name() == "supabase":
+                        get_storage(DATA_DIR, DEFAULT_SETTINGS).delete_rows("reviews", {"review_id": str(row.review_id), "marathon_id": str(marathon_id or row.marathon_id)})
+                    else:
+                        df = read_csv("reviews")
+                        write_csv("reviews", df[df["review_id"].astype(str) != str(row.review_id)].copy())
+                    st.session_state.pop("pending_delete_review_id", None)
+                    st.session_state["review_feedback"] = "완독 감상을 삭제했습니다."
+                    st.rerun()
+                if c2.button("취소", key=f"cancel_delete_review_{row.review_id}"):
+                    st.session_state.pop("pending_delete_review_id", None)
+                    st.rerun()
+            elif st.button("감상 삭제", key=f"delete_review_{row.review_id}", disabled=not is_admin()):
+                st.session_state["pending_delete_review_id"] = str(row.review_id)
+                st.rerun()
 
 def page_records(data: dict) -> None:
     st.title("🗂️ 기록 모아보기")
@@ -2911,7 +3086,8 @@ def page_settings(data: dict) -> None:
                                 for column, value in values.items():
                                     latest_members.loc[mask, column] = value
                                 write_csv("family_members", latest_members)
-                            st.success("러너 정보를 저장했습니다.")
+                            changed_logs = recalculate_weighted_logs(member_id=member_id)
+                            st.success(f"러너 정보를 저장하고 기존 독서 기록 {changed_logs}개의 가중치를 다시 계산했습니다.")
                             st.rerun()
 
                 st.divider()
